@@ -29,3 +29,6 @@ Thumbs.db
 # Logs e cache
 *.log
 .cache/
+
+# Dados do utilizador (portfolio guardado)
+data/
