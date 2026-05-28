@@ -14,6 +14,7 @@ import json
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
 from core.alerts import SmtpConfig, build_alert_html, send_alert_email
@@ -34,7 +35,7 @@ from core.rebalance import (
 )
 from core.risk import compute_risk_metrics, markowitz_analysis
 
-__version__ = "0.6.0"
+__version__ = "0.6.1"
 
 PERIOD_OPTIONS = {
     "1 mês": "1mo", "3 meses": "3mo", "6 meses": "6mo",
@@ -316,8 +317,68 @@ with tab_reb:
         c2.plotly_chart(_donut("Percentagem Alvo (%)", "Alvo"), use_container_width=True)
         c3.plotly_chart(_donut("Alocação Final (%)", "Final"), use_container_width=True)
 
-        st.bar_chart(df.set_index("Ticker")[
-            ["Alocação Atual (%)", "Percentagem Alvo (%)", "Alocação Final (%)"]])
+        st.markdown("#### Atual vs. Alvo — Comparação por Ativo")
+        st.caption("Cor das barras Atual: 🟢 desvio < 3 pp · 🟠 desvio 3–6 pp · 🔴 desvio > 6 pp")
+
+        _ALERT_PP = 3.0
+
+        def _dev_color(dev: float) -> str:
+            a = abs(dev)
+            if a < _ALERT_PP:
+                return "#27ae60"
+            if a < _ALERT_PP * 2:
+                return "#e67e22"
+            return "#e74c3c"
+
+        _colors_atual = [_dev_color(float(r["Desvio Atual (pp)"])) for _, r in df.iterrows()]
+        _x_max = max(
+            float(df["Percentagem Alvo (%)"].max()),
+            float(df["Alocação Atual (%)"].max()),
+        ) * 1.3
+
+        fig_cmp = go.Figure()
+        fig_cmp.add_trace(go.Bar(
+            y=df["Ticker"], x=df["Alocação Atual (%)"],
+            name="Atual", orientation="h",
+            marker_color=_colors_atual,
+            customdata=df["Desvio Atual (pp)"],
+            text=[f"{v:.1f}%" for v in df["Alocação Atual (%)"]],
+            textposition="outside",
+            hovertemplate="%{y}<br>Atual: %{x:.2f}%<br>Desvio: %{customdata:+.2f} pp<extra></extra>",
+        ))
+        fig_cmp.add_trace(go.Bar(
+            y=df["Ticker"], x=df["Percentagem Alvo (%)"],
+            name="Alvo", orientation="h",
+            marker_color="rgba(100,149,237,0.6)",
+            text=[f"{v:.1f}%" for v in df["Percentagem Alvo (%)"]],
+            textposition="outside",
+            hovertemplate="%{y}<br>Alvo: %{x:.2f}%<extra></extra>",
+        ))
+        fig_cmp.update_layout(
+            barmode="group",
+            title="Alocação Atual vs. Percentagem Alvo por Ativo",
+            title_x=0.5,
+            xaxis=dict(title="Percentagem (%)", range=[0, _x_max]),
+            yaxis_title="",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+            height=max(300, 80 * len(df)),
+            margin=dict(l=10, r=10, t=60, b=10),
+        )
+        st.plotly_chart(fig_cmp, use_container_width=True)
+
+        _need_attn = df[df["Desvio Atual (pp)"].abs() > _ALERT_PP]
+        if not _need_attn.empty:
+            st.markdown(f"**⚠️ Ativos com desvio > {_ALERT_PP:.0f} pp:**")
+            for _, _row in _need_attn.iterrows():
+                _dev = float(_row["Desvio Atual (pp)"])
+                _icon = "🔴" if _dev > 0 else "🔵"
+                _word = "sobre-alocado" if _dev > 0 else "sub-alocado"
+                st.warning(
+                    f"{_icon} **{_row['Ticker']}** {_word} em **{_dev:+.2f} pp** "
+                    f"· atual {_row['Alocação Atual (%)']:.1f}% · alvo {_row['Percentagem Alvo (%)']:.1f}%"
+                )
+        else:
+            st.success(f"✅ Todos os ativos dentro do limiar de ±{_ALERT_PP:.0f} pp.")
 
         st.markdown("#### Alertas")
         level, msg = rebalance_urgency(df["Desvio Atual (pp)"].tolist(), deviation_alert)
