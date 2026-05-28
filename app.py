@@ -39,7 +39,19 @@ from core.rebalance import (
 from core.risk import compute_drawdown, compute_risk_metrics, markowitz_analysis
 from core.tax import compute_unrealized_gains
 
-__version__ = "0.7.0"
+__version__ = "0.7.1"
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_full() -> pd.DataFrame:
+    """Cache load_portfolio_full() — evita 3 requests HTTP ao Supabase por render."""
+    return load_portfolio_full()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_history() -> list[dict]:
+    """Cache load_history() — evita 1 request HTTP ao Supabase por render."""
+    return load_history()
 
 
 PERIOD_OPTIONS = {
@@ -114,7 +126,11 @@ for k, v in _defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 if st.session_state.portfolio_df is None:
-    st.session_state.portfolio_df = load_portfolio()
+    _full = _cached_full()
+    if not _full.empty:
+        st.session_state.portfolio_df = _full[EDITOR_COLS].reset_index(drop=True)
+    else:
+        st.session_state.portfolio_df = load_portfolio()
 
 
 # ──────────────────────────────────────────────
@@ -279,6 +295,7 @@ with tab_reb:
             edited_df, money_to_invest, prices, currencies, fx)
         st.session_state.portfolio_df = edited_df[EDITOR_COLS].copy()
         save_portfolio(edited_df)
+        _cached_full.clear()
         st.rerun()
 
     df = st.session_state.result_df
@@ -440,6 +457,8 @@ with tab_reb:
             st.session_state.result_df = None
             st.session_state.editor_nonce += 1
             save_portfolio(new_df)
+            _cached_full.clear()
+            _cached_history.clear()
             st.success("✓ Quantidades atualizadas, portfólio guardado, snapshot no histórico.")
             st.rerun()
     else:
@@ -477,6 +496,7 @@ with tab_cen:
         }
         st.session_state.portfolio_df = edited_df[EDITOR_COLS].copy()
         save_portfolio(edited_df)
+        _cached_full.clear()
         st.rerun()
 
     res = st.session_state.scenarios_result
@@ -524,17 +544,19 @@ with tab_cen:
 
 with tab_his:
     st.markdown("### Histórico de Snapshots")
-    snapshots = load_history()
+    snapshots = _cached_history()
     col_top_a, col_top_b = st.columns([3, 1])
     col_top_a.metric("Snapshots guardados", len(snapshots))
     with col_top_b:
         if snapshots and st.button("🗑️ Limpar histórico", type="secondary"):
+            _cached_history.clear()
             write_history([])
             st.rerun()
 
     if st.session_state.result_df is not None:
         if st.button("📸 Tirar snapshot do estado atual"):
             append_snapshot(build_snapshot(st.session_state.result_df, use_final=False, tag="manual"))
+            _cached_history.clear()
             st.success("✓ Snapshot guardado.")
             st.rerun()
     else:
@@ -879,6 +901,7 @@ with tab_opt:
                 st.session_state.result_df = None
                 st.session_state.editor_nonce += 1
                 save_portfolio(new_df)
+                _cached_full.clear()
                 st.success("✓ Pesos de Mínima Volatilidade aplicados.")
                 st.rerun()
         with col_apply_ms:
@@ -896,6 +919,7 @@ with tab_opt:
                 st.session_state.result_df = None
                 st.session_state.editor_nonce += 1
                 save_portfolio(new_df)
+                _cached_full.clear()
                 st.success("✓ Pesos de Máximo Sharpe aplicados.")
                 st.rerun()
 
@@ -1093,7 +1117,7 @@ with tab_div:
     st.markdown("### Dashboard de Dividendos")
     st.caption("Rendimento gerado pelos dividendos dos ativos, yield on cost e calendário de pagamentos.")
 
-    full_for_div = load_portfolio_full()
+    full_for_div = _cached_full()
     if st.button("💰 Calcular Dividendos", type="primary",
                  disabled=edited_df.empty, key="btn_div"):
         with st.spinner("A obter histórico de dividendos..."):
@@ -1177,7 +1201,7 @@ with tab_tax:
         "Os ativos sem preço médio (= 0) são excluídos."
     )
 
-    full_for_tax = load_portfolio_full()
+    full_for_tax = _cached_full()
     tx1, tx2 = st.columns([3, 1])
     tax_rate_pct = tx1.slider("Taxa de imposto sobre mais-valias (%)", 10.0, 50.0, 28.0, 1.0,
                                key="tax_rate_slider")
@@ -1423,7 +1447,7 @@ with tab_mgr:
     st.markdown("### Gestão de Ativos")
     st.caption("Adiciona, edita ou elimina ativos. As alterações reflectem-se imediatamente nas outras tabs.")
 
-    full_df = load_portfolio_full()
+    full_df = _cached_full()
     if not full_df.empty:
         st.markdown("#### Portfólio Atual")
         st.dataframe(full_df.style.format({
@@ -1437,7 +1461,7 @@ with tab_mgr:
     st.divider()
     st.markdown("#### Adicionar / Editar Ativo")
 
-    tickers_list = get_tickers()
+    tickers_list = list(_cached_full()["Ticker"]) if not full_df.empty else []
     mode = st.radio("Modo", ["Adicionar novo", "Editar existente"],
                     horizontal=True, key="mgr_mode")
 
@@ -1497,6 +1521,7 @@ with tab_mgr:
         else:
             upsert_asset(t_save, f_name.strip(), f_type, f_exchange.strip(),
                          f_target, f_qty, f_avg)
+            _cached_full.clear()
             st.session_state.portfolio_df = load_portfolio()
             st.session_state.result_df = None
             st.session_state.editor_nonce += 1
@@ -1519,6 +1544,7 @@ with tab_mgr:
             col_y, col_n = st.columns(2)
             if col_y.button("✅ Confirmar", type="primary", key="mgr_del_yes"):
                 delete_asset(st.session_state.del_pending)
+                _cached_full.clear()
                 del st.session_state["del_pending"]
                 st.session_state.portfolio_df = load_portfolio()
                 st.session_state.result_df = None
