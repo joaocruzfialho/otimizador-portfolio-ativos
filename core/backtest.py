@@ -5,6 +5,34 @@ import pandas as pd
 
 TRADING_DAYS = 252
 
+# Well-known model portfolios (US-listed ETF proxies; long history on yfinance)
+MODEL_PORTFOLIOS: dict[str, dict[str, float]] = {
+    "60/40 Clássico": {
+        "SPY": 0.60,   # US equities
+        "TLT": 0.40,   # US long-term bonds
+    },
+    "All-Weather (Dalio)": {
+        "VTI": 0.30,
+        "TLT": 0.40,
+        "IEF": 0.15,
+        "GLD": 0.075,
+        "DBC": 0.075,
+    },
+    "Permanent Portfolio": {
+        "VTI": 0.25,
+        "TLT": 0.25,
+        "GLD": 0.25,
+        "SHY": 0.25,
+    },
+    "Golden Butterfly": {
+        "VTI": 0.20,
+        "IJS": 0.20,   # small-cap value
+        "TLT": 0.20,
+        "SHY": 0.20,
+        "GLD": 0.20,
+    },
+}
+
 
 def _rebalance_dates(index: pd.DatetimeIndex, freq: str) -> set:
     if freq == "never":
@@ -101,3 +129,49 @@ def run_backtest(
         "missing_tickers": [t for t in target_weights if t not in closes.columns],
         "tickers_used": tickers,
     }
+
+
+def compare_model_portfolios(
+    model_closes: pd.DataFrame,
+    initial_capital: float,
+    rf_rate: float,
+    user_bh_series: "pd.Series | None" = None,
+) -> pd.DataFrame:
+    """
+    Run buy-and-hold backtest for each MODEL_PORTFOLIO and return a comparison table.
+    model_closes: DataFrame with all needed tickers as columns.
+    user_bh_series: optional Series of user portfolio value (same index) for comparison.
+    Returns DataFrame with one row per portfolio.
+    """
+    rows = []
+
+    if user_bh_series is not None and len(user_bh_series) > 1:
+        m = _metrics(user_bh_series, rf_rate)
+        rows.append({
+            "Portfólio": "O Meu Portfólio",
+            "CAGR (%)": m["CAGR"] * 100,
+            "Volatilidade (%)": m["Volatilidade"] * 100,
+            "Sharpe": m["Sharpe"],
+            "Max Drawdown (%)": m["Max Drawdown"] * 100,
+            "Retorno Total (%)": m["Retorno Total"] * 100,
+            "Valor Final (€)": m["Valor Final (€)"],
+            "_series": user_bh_series,
+        })
+
+    for name, weights in MODEL_PORTFOLIOS.items():
+        r = run_backtest(model_closes, weights, initial_capital, "never", rf_rate)
+        if not r or not r.get("tickers_used"):
+            continue
+        m = r["bh_metrics"]
+        rows.append({
+            "Portfólio": name,
+            "CAGR (%)": m["CAGR"] * 100,
+            "Volatilidade (%)": m["Volatilidade"] * 100,
+            "Sharpe": m["Sharpe"],
+            "Max Drawdown (%)": m["Max Drawdown"] * 100,
+            "Retorno Total (%)": m["Retorno Total"] * 100,
+            "Valor Final (€)": m["Valor Final (€)"],
+            "_series": r["bh"],
+        })
+
+    return pd.DataFrame(rows) if rows else pd.DataFrame()

@@ -58,6 +58,20 @@ def fetch_fx_to_eur(currency: str) -> float | None:
     return None
 
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_ter(ticker: str) -> float | None:
+    """Total Expense Ratio as a decimal (e.g. 0.002 = 0.20%). None if unavailable."""
+    try:
+        info = yf.Ticker(ticker).info
+        for key in ("annualReportExpenseRatio", "expenseRatio"):
+            val = info.get(key)
+            if val and float(val) > 0:
+                return float(val)
+    except Exception:
+        pass
+    return None
+
+
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_historical_closes(tickers: tuple[str, ...], period: str) -> pd.DataFrame:
     if not tickers:

@@ -1,7 +1,8 @@
 """
-Otimizador de Portfólio de Ativos — v0.6.0
+Otimizador de Portfólio de Ativos — v0.7.0
 
-Tabs: Rebalancear · Cenários · Histórico · Risco · Otimizar · Backtest · Gerir
+Tabs: Rebalancear · Cenários · Histórico · Risco · Otimizar · Backtest
+      Dividendos · Fiscalidade · FIRE · Gerir
 Alertas por email configuráveis na sidebar.
 
 Autor: João Fialho
@@ -18,24 +19,28 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from core.alerts import SmtpConfig, build_alert_html, send_alert_email
-from core.backtest import run_backtest
+from core.backtest import MODEL_PORTFOLIOS, compare_model_portfolios, run_backtest
 from core.db import (
     ASSET_TYPES, delete_asset, get_asset, get_tickers,
     load_portfolio_full, upsert_asset,
 )
+from core.dividends import portfolio_dividend_report
+from core.fire import run_fire_simulation
 from core.history import (
     append_snapshot, build_snapshot, df_to_export_json,
     history_to_evolution_dfs, load_history, load_portfolio,
     save_portfolio, write_history, PORTFOLIO_FILE, EDITOR_COLS,
 )
-from core.prices import fetch_fx_to_eur, fetch_historical_closes, fetch_price_and_currency
+from core.prices import fetch_fx_to_eur, fetch_historical_closes, fetch_price_and_currency, fetch_ter
 from core.rebalance import (
     compute_rebalance_result, health_score, parse_scenarios,
     rebalance_urgency,
 )
-from core.risk import compute_risk_metrics, markowitz_analysis
+from core.risk import compute_drawdown, compute_risk_metrics, markowitz_analysis
+from core.tax import compute_unrealized_gains
 
-__version__ = "0.6.1"
+__version__ = "0.7.0"
+
 
 PERIOD_OPTIONS = {
     "1 mês": "1mo", "3 meses": "3mo", "6 meses": "6mo",
@@ -87,6 +92,16 @@ _defaults: dict = {
     "bkt_period": "3 anos",
     "bkt_capital": 10000.0,
     "bkt_freq": "Trimestral",
+    "model_cmp_result": None,
+    "div_data": None,
+    "tax_data": None,
+    "fire_result": None,
+    "fire_portfolio_value": 50000.0,
+    "fire_spending": 20000.0,
+    "fire_years": 30,
+    "fire_ret_mean": 7.0,
+    "fire_ret_std": 15.0,
+    "fire_inflation": 2.5,
     "del_pending": None,
     # email (never persisted to disk)
     "smtp_host": "smtp.gmail.com",
@@ -237,9 +252,10 @@ else:
 # Tabs
 # ──────────────────────────────────────────────
 
-tab_reb, tab_cen, tab_his, tab_ris, tab_opt, tab_bkt, tab_mgr = st.tabs([
+tab_reb, tab_cen, tab_his, tab_ris, tab_opt, tab_bkt, tab_div, tab_tax, tab_fire, tab_mgr = st.tabs([
     "💼 Rebalancear", "🎯 Cenários", "📈 Histórico",
-    "⚖️ Risco", "🔬 Otimizar", "🔄 Backtest", "⚙️ Gerir",
+    "⚖️ Risco", "🔬 Otimizar", "🔄 Backtest",
+    "💰 Dividendos", "🧾 Fiscalidade", "🔥 FIRE", "⚙️ Gerir",
 ])
 
 
@@ -584,10 +600,14 @@ with tab_ris:
             st.error("Sem dados históricos."); st.stop()
         target_pct = dict(zip(edited_df["Ticker"], edited_df["Percentagem Alvo (%)"]))
         per_asset, corr, port = compute_risk_metrics(closes, target_pct, rf_pct / 100)
+        dd = compute_drawdown(closes, target_pct)
         st.session_state.risk_data = {
             "per_asset": per_asset, "corr": corr, "portfolio": port,
             "period": risk_period, "rf_pct": rf_pct,
             "missing": [t for t in edited_df["Ticker"] if t not in closes.columns],
+            "drawdown": dd,
+            "closes": closes,
+            "target_pct": target_pct,
         }
         st.rerun()
 
@@ -629,6 +649,112 @@ with tab_ris:
             fig_c.update_layout(height=max(320, 70 * len(corr)), title_x=0.5)
             st.plotly_chart(fig_c, use_container_width=True)
             st.caption("Valores próximos de 0 → boa diversificação; próximos de 1 → ativos movem-se juntos.")
+
+        # ── Drawdown ────────────────────────────────────
+        dd = rd.get("drawdown", {})
+        if dd:
+            st.markdown("#### Drawdown — Quedas e Recuperações")
+            dd_ser: pd.Series = dd["drawdown"]
+            port_val: pd.Series = dd["port_value"]
+
+            dm1, dm2, dm3 = st.columns(3)
+            dm1.metric("Max Drawdown", f"{dd['max_drawdown']*100:.2f}%")
+            dm2.metric("Data do Mínimo", str(dd["max_drawdown_date"])[:10])
+            if not dd["periods"].empty:
+                dm3.metric("Nº de Períodos", len(dd["periods"]))
+
+            fig_dd = go.Figure()
+            fig_dd.add_trace(go.Scatter(
+                x=dd_ser.index, y=dd_ser.values * 100,
+                fill="tozeroy", fillcolor="rgba(231,76,60,0.25)",
+                line=dict(color="#e74c3c", width=1.5),
+                name="Drawdown (%)",
+                hovertemplate="%{x|%Y-%m-%d}: %{y:.2f}%<extra></extra>",
+            ))
+            fig_dd.update_layout(
+                title="Underwater Chart — Afastamento do Máximo Histórico",
+                title_x=0.5, height=320,
+                yaxis=dict(title="Drawdown (%)", tickformat=".1f"),
+                xaxis_title="", margin=dict(l=10, r=10, t=50, b=10),
+            )
+            st.plotly_chart(fig_dd, use_container_width=True)
+
+            if not dd["periods"].empty:
+                with st.expander(f"📋 {len(dd['periods'])} períodos de drawdown"):
+                    st.dataframe(dd["periods"].style.format({
+                        "Queda Máx. (%)": "{:.2f}",
+                        "Dias até Mínimo": "{:d}",
+                        "Duração Total (dias)": "{:d}",
+                    }), use_container_width=True, hide_index=True)
+
+        # ── TER / Fee Drag ──────────────────────────────
+        st.markdown("#### Custos — TER e Arrastamento de Comissões")
+        ter_tickers = edited_df["Ticker"].tolist()
+        ter_weights = dict(zip(edited_df["Ticker"], edited_df["Percentagem Alvo (%)"]))
+        total_w = sum(ter_weights.values())
+
+        ter_rows = []
+        for t in ter_tickers:
+            ter_val = fetch_ter(t)
+            w_pct = ter_weights.get(t, 0) / total_w * 100 if total_w > 0 else 0
+            ter_rows.append({
+                "Ticker": t,
+                "Peso (%)": w_pct,
+                "TER (%)": ter_val * 100 if ter_val else None,
+                "Contribuição (pp)": (ter_val * w_pct / 100 * 100) if ter_val else None,
+            })
+
+        ter_df = pd.DataFrame(ter_rows)
+        ter_known = ter_df.dropna(subset=["TER (%)"])
+        weighted_ter = float(
+            (ter_known["TER (%)"] * ter_known["Peso (%)"] / 100).sum()
+        ) if not ter_known.empty else 0.0
+
+        tc1, tc2, tc3 = st.columns(3)
+        tc1.metric("TER Ponderado", f"{weighted_ter:.3f}%/ano")
+        cap_base = float(total_cur if 'total_cur' in dir() else 10000.0)
+        tc2.metric("Custo Anual Estimado",
+                   f"€{cap_base * weighted_ter / 100:,.2f}")
+        drag_30y = cap_base * ((1.07 ** 30) - (1.07 - weighted_ter / 100) ** 30)
+        tc3.metric("Arrastamento em 30 anos (hipot.)",
+                   f"€{drag_30y:,.0f}",
+                   help="Diferença acumulada vs. portfólio idêntico sem custos, assumindo 7%/ano")
+
+        if not ter_df.empty:
+            st.dataframe(ter_df.style.format({
+                "Peso (%)": "{:.1f}",
+                "TER (%)": lambda v: f"{v:.3f}" if pd.notna(v) else "N/D",
+                "Contribuição (pp)": lambda v: f"{v:.4f}" if pd.notna(v) else "N/D",
+            }), use_container_width=True, hide_index=True)
+            if ter_df["TER (%)"].isna().any():
+                st.caption("N/D = TER não disponível via yfinance para esse ticker.")
+
+        # Fee drag comparison chart (10/20/30 years)
+        if weighted_ter > 0:
+            years_range = list(range(0, 31))
+            base_rate = 0.07
+            fig_fee = go.Figure()
+            fig_fee.add_trace(go.Scatter(
+                x=years_range,
+                y=[cap_base * (base_rate ** yr if yr == 0 else (1 + base_rate) ** yr) for yr in years_range],
+                name="Sem custos (7%/ano)", line=dict(color="#27ae60", dash="dot"),
+            ))
+            fig_fee.add_trace(go.Scatter(
+                x=years_range,
+                y=[cap_base * (1 + base_rate - weighted_ter / 100) ** yr for yr in years_range],
+                name=f"Com TER {weighted_ter:.3f}%", line=dict(color="#e74c3c"),
+                fill="tonexty", fillcolor="rgba(231,76,60,0.10)",
+            ))
+            fig_fee.update_layout(
+                title="Impacto dos Custos no Crescimento do Capital",
+                title_x=0.5, height=320,
+                yaxis=dict(title="Valor (€)", tickformat="€,.0f"),
+                xaxis_title="Anos",
+                legend=dict(orientation="h", y=1.02, x=0),
+                margin=dict(l=10, r=10, t=60, b=10),
+            )
+            st.plotly_chart(fig_fee, use_container_width=True)
+            st.caption("Hipótese: capital inicial = valor actual do portfólio; retorno bruto fixo de 7%/ano.")
     else:
         st.info("Clica em **Analisar** para calcular as métricas de risco.")
 
@@ -885,9 +1011,412 @@ with tab_bkt:
     else:
         st.info("Define os parâmetros e clica em **Executar Backtest**.")
 
+    # ── Comparação com portfólios modelo ────────
+    st.divider()
+    st.markdown("#### Comparação com Portfólios Modelo")
+    st.caption("Compara o teu portfólio (Buy & Hold) com carteiras de referência clássicas usando ETFs norte-americanos como proxy.")
+
+    col_mc1, col_mc2, col_mc3 = st.columns([2, 2, 1])
+    mc_period = col_mc1.selectbox("Período", list(PERIOD_OPTIONS.keys()),
+                                   index=list(PERIOD_OPTIONS.keys()).index("3 anos"),
+                                   key="sel_mc_period")
+    mc_capital = col_mc2.number_input("Capital inicial (€)", 1000.0, 1_000_000.0,
+                                       float(st.session_state.bkt_capital), 1000.0,
+                                       format="%.0f", key="ni_mc_cap")
+    if col_mc3.button("📊 Comparar", type="primary", disabled=edited_df.empty or not sum_is_valid):
+        model_tickers = set()
+        for w in MODEL_PORTFOLIOS.values():
+            model_tickers.update(w.keys())
+        with st.spinner("A obter dados dos portfólios modelo..."):
+            model_closes = fetch_historical_closes(tuple(sorted(model_tickers)),
+                                                   PERIOD_OPTIONS[mc_period])
+            user_closes_mc = fetch_historical_closes(tuple(edited_df["Ticker"].tolist()),
+                                                     PERIOD_OPTIONS[mc_period])
+        user_weights_mc = dict(zip(edited_df["Ticker"], edited_df["Percentagem Alvo (%)"]))
+        user_bh = None
+        if not user_closes_mc.empty:
+            r_user = run_backtest(user_closes_mc, user_weights_mc, mc_capital, "never",
+                                  float(st.session_state.rf_rate_pct) / 100)
+            if r_user:
+                user_bh = r_user["bh"]
+        cmp_df = compare_model_portfolios(model_closes, mc_capital,
+                                          float(st.session_state.rf_rate_pct) / 100,
+                                          user_bh_series=user_bh)
+        st.session_state.model_cmp_result = {"df": cmp_df, "period": mc_period}
+        st.rerun()
+
+    mc = st.session_state.model_cmp_result
+    if mc and not mc["df"].empty:
+        cdf = mc["df"]
+        display_cols = ["Portfólio", "CAGR (%)", "Volatilidade (%)", "Sharpe",
+                        "Max Drawdown (%)", "Retorno Total (%)", "Valor Final (€)"]
+        show_df = cdf[[c for c in display_cols if c in cdf.columns]]
+        st.dataframe(show_df.style.format({
+            "CAGR (%)": "{:+.2f}%",
+            "Volatilidade (%)": "{:.2f}%",
+            "Sharpe": "{:.2f}",
+            "Max Drawdown (%)": "{:.2f}%",
+            "Retorno Total (%)": "{:+.2f}%",
+            "Valor Final (€)": "€{:,.2f}",
+        }), use_container_width=True, hide_index=True)
+
+        # Evolution chart
+        fig_mc = go.Figure()
+        for _, row in cdf.iterrows():
+            ser = row.get("_series")
+            if ser is not None and len(ser) > 1:
+                fig_mc.add_trace(go.Scatter(
+                    x=ser.index, y=ser.values,
+                    name=row["Portfólio"],
+                    mode="lines",
+                    line=dict(width=2.5 if row["Portfólio"] == "O Meu Portfólio" else 1.5),
+                ))
+        fig_mc.update_layout(
+            title=f"Evolução do Capital — {mc['period']}",
+            title_x=0.5, height=400,
+            yaxis=dict(title="Valor (€)", tickformat="€,.0f"),
+            xaxis_title="",
+            legend=dict(orientation="h", y=-0.2),
+            margin=dict(l=10, r=10, t=50, b=10),
+        )
+        st.plotly_chart(fig_mc, use_container_width=True)
+        st.caption("Portfólios modelo usam ETFs norte-americanos (SPY, TLT, VTI, GLD, etc.) como proxy — sem custos de câmbio nem TER.")
+    elif mc:
+        st.warning("Sem dados suficientes para comparar no período escolhido.")
+
 
 # ══════════════════════════════════════════════
-# Tab 7: Gerir
+# Tab 7: Dividendos
+# ══════════════════════════════════════════════
+
+with tab_div:
+    st.markdown("### Dashboard de Dividendos")
+    st.caption("Rendimento gerado pelos dividendos dos ativos, yield on cost e calendário de pagamentos.")
+
+    full_for_div = load_portfolio_full()
+    if st.button("💰 Calcular Dividendos", type="primary",
+                 disabled=edited_df.empty, key="btn_div"):
+        with st.spinner("A obter histórico de dividendos..."):
+            prices_d, currencies_d, fx_d, _, _ = fetch_prices_and_fx(edited_df["Ticker"].tolist())
+        prices_eur_d = {}
+        for t in edited_df["Ticker"]:
+            p = prices_d.get(t)
+            cur = currencies_d.get(t, "EUR")
+            rate = fx_d.get(cur, 1.0) or 1.0
+            prices_eur_d[t] = float(p * rate) if p else 0.0
+
+        qtys_d = dict(zip(edited_df["Ticker"], edited_df["Quantidade Detida"]))
+        avgs_d = {} if full_for_div.empty else dict(
+            zip(full_for_div["Ticker"], full_for_div["Preço Médio (€)"])
+        )
+        per_asset_div, total_div, calendar_div = portfolio_dividend_report(
+            edited_df["Ticker"].tolist(), qtys_d, avgs_d, prices_eur_d,
+        )
+        st.session_state.div_data = {
+            "per_asset": per_asset_div,
+            "total": total_div,
+            "calendar": calendar_div,
+        }
+        st.rerun()
+
+    dv = st.session_state.div_data
+    if dv:
+        total_div_val = dv["total"]
+        dv1, dv2, dv3 = st.columns(3)
+        dv1.metric("Rendimento Anual Total", f"€{total_div_val:,.2f}")
+        dv2.metric("Rendimento Mensal Médio", f"€{total_div_val/12:,.2f}")
+        dv3.metric("Ativos com Dividendos",
+                   int((dv["per_asset"]["Rendimento Anual (€)"] > 0).sum()))
+
+        st.markdown("#### Por Ativo")
+        pa = dv["per_asset"]
+        st.dataframe(pa.style.format({
+            "Rendimento Anual (€)": "€{:.2f}",
+            "Yield Atual (%)": "{:.2f}%",
+            "Yield on Cost (%)": "{:.2f}%",
+            "DGR 3A (%)": lambda v: f"{v:.2f}%" if pd.notna(v) else "N/D",
+            "DGR 5A (%)": lambda v: f"{v:.2f}%" if pd.notna(v) else "N/D",
+        }), use_container_width=True, hide_index=True)
+
+        # Income bar chart
+        if not pa.empty and pa["Rendimento Anual (€)"].sum() > 0:
+            fig_div = px.bar(
+                pa[pa["Rendimento Anual (€)"] > 0],
+                x="Ticker", y="Rendimento Anual (€)",
+                text=pa[pa["Rendimento Anual (€)"] > 0]["Rendimento Anual (€)"].apply(
+                    lambda v: f"€{v:.2f}"),
+                title="Rendimento Anual por Ativo (€)",
+                color="Ticker",
+            )
+            fig_div.update_traces(textposition="outside")
+            fig_div.update_layout(height=350, title_x=0.5, showlegend=False,
+                                   yaxis_title="€/ano")
+            st.plotly_chart(fig_div, use_container_width=True)
+
+        # Calendar
+        if not dv["calendar"].empty:
+            st.markdown("#### Calendário de Pagamentos (últimos 24 meses)")
+            st.dataframe(dv["calendar"].style.format({
+                "Div/Ação (€)": "{:.4f}",
+                "Rendimento (€)": "€{:.2f}",
+            }), use_container_width=True, hide_index=True)
+        else:
+            st.info("Sem histórico de pagamentos nos últimos 24 meses.")
+    else:
+        st.info("Clica em **Calcular Dividendos** para analisar o rendimento do portfólio.")
+
+
+# ══════════════════════════════════════════════
+# Tab 8: Fiscalidade
+# ══════════════════════════════════════════════
+
+with tab_tax:
+    st.markdown("### Mais-Valias Latentes e Tax-Loss Harvesting")
+    st.caption(
+        "Análise fiscal com base no preço médio de compra registado. "
+        "Os ativos sem preço médio (= 0) são excluídos."
+    )
+
+    full_for_tax = load_portfolio_full()
+    tx1, tx2 = st.columns([3, 1])
+    tax_rate_pct = tx1.slider("Taxa de imposto sobre mais-valias (%)", 10.0, 50.0, 28.0, 1.0,
+                               key="tax_rate_slider")
+    loss_thresh_pct = tx2.number_input("Limiar menos-valia (%)", -50.0, 0.0, -10.0, 1.0,
+                                        key="tax_loss_thresh")
+
+    if st.button("🧾 Calcular Mais-Valias", type="primary",
+                 disabled=edited_df.empty, key="btn_tax"):
+        with st.spinner("A obter preços actuais..."):
+            prices_t, currencies_t, fx_t, _, _ = fetch_prices_and_fx(edited_df["Ticker"].tolist())
+        prices_eur_t = {}
+        for t in edited_df["Ticker"]:
+            p = prices_t.get(t)
+            cur = currencies_t.get(t, "EUR")
+            rate = fx_t.get(cur, 1.0) or 1.0
+            prices_eur_t[t] = float(p * rate) if p else 0.0
+
+        qtys_t = dict(zip(edited_df["Ticker"], edited_df["Quantidade Detida"]))
+        avgs_t = {} if full_for_tax.empty else dict(
+            zip(full_for_tax["Ticker"], full_for_tax["Preço Médio (€)"])
+        )
+        tax_df, total_gain, total_tax = compute_unrealized_gains(
+            edited_df["Ticker"].tolist(), qtys_t, avgs_t, prices_eur_t,
+            tax_rate=tax_rate_pct / 100,
+        )
+        st.session_state.tax_data = {
+            "df": tax_df, "total_gain": total_gain, "total_tax": total_tax,
+        }
+        st.rerun()
+
+    td = st.session_state.tax_data
+    if td:
+        tax_df = td["df"]
+        if tax_df.empty:
+            st.warning("Nenhum ativo com preço médio de compra registado. "
+                       "Regista os preços médios na tab **⚙️ Gerir**.")
+        else:
+            tg1, tg2, tg3 = st.columns(3)
+            tg1.metric("Mais-Valia Total", f"€{td['total_gain']:,.2f}",
+                       delta=f"{'ganho' if td['total_gain'] >= 0 else 'perda'}")
+            tg2.metric("Imposto Estimado (se vendido tudo)", f"€{td['total_tax']:,.2f}")
+            n_losses = int((tax_df["Mais-Valia (€)"] < 0).sum())
+            tg3.metric("Posições com Menos-Valia", n_losses)
+
+            st.markdown("#### Detalhe por Ativo")
+            st.dataframe(tax_df.style.format({
+                "Qtd.": "{:.4f}",
+                "Preço Médio (€)": "€{:.4f}",
+                "Preço Atual (€)": "€{:.4f}",
+                "Custo Base (€)": "€{:.2f}",
+                "Valor Atual (€)": "€{:.2f}",
+                "Mais-Valia (€)": "€{:+.2f}",
+                "Mais-Valia (%)": "{:+.2f}%",
+                "Imposto Estimado (€)": "€{:.2f}",
+            }).apply(
+                lambda col: ["background-color: #2d5016" if v >= 0 else "background-color: #5a1a1a"
+                             for v in tax_df["Mais-Valia (€)"]]
+                if col.name == "Mais-Valia (€)" else [""] * len(col),
+                axis=0,
+            ), use_container_width=True, hide_index=True)
+
+            # Tax-loss harvesting candidates
+            candidates = tax_df[tax_df["Mais-Valia (%)"] < loss_thresh_pct]
+            if not candidates.empty:
+                st.markdown(f"#### 🎯 Candidatos a Tax-Loss Harvesting (< {loss_thresh_pct:.0f}%)")
+                for _, row in candidates.iterrows():
+                    st.warning(
+                        f"🔴 **{row['Ticker']}** — menos-valia de **€{row['Mais-Valia (€)']:+.2f}** "
+                        f"({row['Mais-Valia (%)']:+.2f}%) · pode reduzir imposto em €{abs(row['Mais-Valia (€)']) * tax_rate_pct / 100:.2f}"
+                    )
+            else:
+                st.success(f"✅ Nenhum ativo com menos-valia abaixo de {loss_thresh_pct:.0f}%.")
+
+            # Waterfall chart
+            fig_tax = go.Figure(go.Bar(
+                x=tax_df["Ticker"],
+                y=tax_df["Mais-Valia (€)"],
+                marker_color=["#27ae60" if v >= 0 else "#e74c3c"
+                               for v in tax_df["Mais-Valia (€)"]],
+                text=[f"€{v:+.0f}" for v in tax_df["Mais-Valia (€)"]],
+                textposition="outside",
+            ))
+            fig_tax.update_layout(
+                title="Mais-Valias Latentes por Ativo (€)",
+                title_x=0.5, height=350,
+                yaxis_title="€", yaxis_tickformat="€,.0f",
+                xaxis_title="",
+                margin=dict(l=10, r=10, t=50, b=10),
+            )
+            st.plotly_chart(fig_tax, use_container_width=True)
+    else:
+        st.info("Clica em **Calcular Mais-Valias** para analisar a exposição fiscal.")
+
+
+# ══════════════════════════════════════════════
+# Tab 9: FIRE
+# ══════════════════════════════════════════════
+
+with tab_fire:
+    st.markdown("### Calculadora FIRE — Monte Carlo de Retirada")
+    st.caption(
+        "Simula N=5000 cenários de retirada para estimar a probabilidade de o portfólio "
+        "sobreviver ao horizonte de reforma. Retornos gerados por distribuição normal."
+    )
+
+    fc1, fc2 = st.columns(2)
+    with fc1:
+        fire_pv = st.number_input(
+            "Capital Actual (€)", 1000.0, 10_000_000.0,
+            float(st.session_state.fire_portfolio_value), 1000.0,
+            format="%.0f", key="ni_fire_pv",
+        )
+        fire_spend = st.number_input(
+            "Despesa Anual (€)", 1000.0, 1_000_000.0,
+            float(st.session_state.fire_spending), 500.0,
+            format="%.0f", key="ni_fire_spend",
+        )
+        fire_years = st.slider("Horizonte (anos)", 5, 60,
+                               int(st.session_state.fire_years), 1, key="sl_fire_years")
+    with fc2:
+        fire_ret = st.number_input(
+            "Retorno Médio Esperado (%/ano)", 0.0, 30.0,
+            float(st.session_state.fire_ret_mean), 0.5,
+            format="%.1f", key="ni_fire_ret",
+        )
+        fire_std = st.number_input(
+            "Volatilidade (%/ano)", 1.0, 50.0,
+            float(st.session_state.fire_ret_std), 0.5,
+            format="%.1f", key="ni_fire_std",
+        )
+        fire_infl = st.number_input(
+            "Inflação (%/ano)", 0.0, 15.0,
+            float(st.session_state.fire_inflation), 0.1,
+            format="%.1f", key="ni_fire_infl",
+        )
+
+    fire_swr_input = fire_pv * 0.04
+    st.caption(f"Regra dos 4% → €{fire_swr_input:,.0f}/ano · "
+               f"Rácio actual: {fire_spend/fire_pv*100:.2f}% do capital")
+
+    if st.button("🔥 Simular", type="primary", key="btn_fire"):
+        st.session_state.fire_portfolio_value = fire_pv
+        st.session_state.fire_spending = fire_spend
+        st.session_state.fire_years = fire_years
+        st.session_state.fire_ret_mean = fire_ret
+        st.session_state.fire_ret_std = fire_std
+        st.session_state.fire_inflation = fire_infl
+        with st.spinner("A correr 5 000 simulações Monte Carlo..."):
+            fire_res = run_fire_simulation(
+                portfolio_value=fire_pv,
+                annual_spending=fire_spend,
+                years=fire_years,
+                annual_return_mean=fire_ret / 100,
+                annual_return_std=fire_std / 100,
+                inflation_rate=fire_infl / 100,
+            )
+        st.session_state.fire_result = fire_res
+        st.rerun()
+
+    fr = st.session_state.fire_result
+    if fr:
+        sr = fr["success_rate"]
+        safe = fr["safe_swr"]
+
+        # Main metrics
+        fm1, fm2, fm3 = st.columns(3)
+        color = "normal" if sr >= 0.90 else "inverse"
+        fm1.metric("Probabilidade de Sucesso",
+                   f"{sr*100:.1f}%",
+                   delta="seguro" if sr >= 0.95 else ("atenção" if sr >= 0.80 else "risco"),
+                   delta_color=("normal" if sr >= 0.95 else ("off" if sr >= 0.80 else "inverse")))
+        fm2.metric("Taxa Máx. Segura (95% sucesso)",
+                   f"{safe*100:.2f}%" if safe else "N/D",
+                   delta=f"€{fire_pv*safe:,.0f}/ano" if safe else "")
+        fm3.metric("Regra dos 4%",
+                   f"{'✅' if fire_spend <= fire_pv*0.04 else '⚠️'} {fire_spend/fire_pv*100:.2f}% do capital")
+
+        if sr < 0.80:
+            st.error("🔴 Probabilidade de sucesso abaixo de 80% — considera reduzir a despesa ou aumentar o capital.")
+        elif sr < 0.95:
+            st.warning("🟡 Probabilidade entre 80–95% — margem de segurança reduzida.")
+        else:
+            st.success("🟢 Probabilidade ≥ 95% — plano robusto com os parâmetros actuais.")
+
+        # Fan chart
+        pcts = fr["percentiles"]
+        fig_fire = go.Figure()
+        fig_fire.add_trace(go.Scatter(
+            x=pcts["Ano"], y=pcts["p95"], name="P95",
+            line=dict(width=0), showlegend=False,
+        ))
+        fig_fire.add_trace(go.Scatter(
+            x=pcts["Ano"], y=pcts["p75"], name="P25–P75",
+            fill="tonexty", fillcolor="rgba(39,174,96,0.15)",
+            line=dict(width=0),
+        ))
+        fig_fire.add_trace(go.Scatter(
+            x=pcts["Ano"], y=pcts["p25"], name="P5–P25",
+            fill="tonexty", fillcolor="rgba(39,174,96,0.25)",
+            line=dict(width=0),
+        ))
+        fig_fire.add_trace(go.Scatter(
+            x=pcts["Ano"], y=pcts["p5"], name="P5",
+            fill="tonexty", fillcolor="rgba(231,76,60,0.15)",
+            line=dict(color="#e74c3c", width=1, dash="dot"), showlegend=False,
+        ))
+        fig_fire.add_trace(go.Scatter(
+            x=pcts["Ano"], y=pcts["p50"], name="Mediana (P50)",
+            line=dict(color="#27ae60", width=2.5),
+        ))
+        fig_fire.add_hline(y=0, line=dict(color="white", dash="dash", width=1))
+        fig_fire.update_layout(
+            title=f"Evolução do Portfólio — {fire_years} anos · 5 000 simulações",
+            title_x=0.5, height=420,
+            yaxis=dict(title="Valor (€)", tickformat="€,.0f"),
+            xaxis_title="Ano",
+            legend=dict(orientation="h", y=-0.2),
+            margin=dict(l=10, r=10, t=60, b=10),
+        )
+        st.plotly_chart(fig_fire, use_container_width=True)
+
+        # Depletion histogram
+        if fr["depletion_years"]:
+            depl_df = pd.DataFrame({"Ano de falência": fr["depletion_years"]})
+            fig_depl = px.histogram(
+                depl_df, x="Ano de falência", nbins=fire_years,
+                title="Distribuição do Ano de Falência (simulações falhadas)",
+                color_discrete_sequence=["#e74c3c"],
+            )
+            fig_depl.update_layout(height=300, title_x=0.5,
+                                    yaxis_title="Nº de simulações")
+            st.plotly_chart(fig_depl, use_container_width=True)
+            st.caption(f"{len(fr['depletion_years'])} de {fr['n_simulations']} simulações esgotaram o capital.")
+    else:
+        st.info("Define os parâmetros e clica em **Simular** para correr a análise FIRE.")
+
+
+# ══════════════════════════════════════════════
+# Tab 10: Gerir
 # ══════════════════════════════════════════════
 
 with tab_mgr:

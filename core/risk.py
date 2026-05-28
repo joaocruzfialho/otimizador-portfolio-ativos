@@ -76,6 +76,63 @@ def compute_risk_metrics(
     return per_asset, corr, port
 
 
+def compute_drawdown(
+    closes: pd.DataFrame,
+    weights: dict[str, float],
+) -> dict:
+    """
+    Portfolio drawdown series from normalised historical closes.
+
+    Returns: drawdown (Series), port_value (Series), max_drawdown (float),
+             max_drawdown_date, periods (DataFrame of distinct drawdown episodes).
+    """
+    if closes.empty:
+        return {}
+
+    tickers = list(closes.columns)
+    w = np.array([float(weights.get(t, 0)) for t in tickers], dtype=float)
+    if w.sum() == 0:
+        w = np.ones(len(tickers)) / len(tickers)
+    else:
+        w = w / w.sum()
+
+    normed = closes / closes.iloc[0]
+    port = (normed * w).sum(axis=1)
+    rolling_max = port.cummax()
+    drawdown = (port - rolling_max) / rolling_max
+
+    max_dd = float(drawdown.min())
+    max_dd_date = drawdown.idxmin()
+
+    periods, in_dd = [], False
+    peak_dt = trough_dt = None
+    trough_val = 0.0
+    for dt, val in drawdown.items():
+        if not in_dd and val < -0.001:
+            in_dd, peak_dt, trough_dt, trough_val = True, dt, dt, val
+        elif in_dd:
+            if val < trough_val:
+                trough_dt, trough_val = dt, val
+            if val >= -0.001:
+                in_dd = False
+                periods.append({
+                    "Início": peak_dt,
+                    "Mínimo": trough_dt,
+                    "Recuperação": dt,
+                    "Queda Máx. (%)": round(trough_val * 100, 2),
+                    "Dias até Mínimo": (trough_dt - peak_dt).days,
+                    "Duração Total (dias)": (dt - peak_dt).days,
+                })
+
+    return {
+        "drawdown": drawdown,
+        "port_value": port,
+        "max_drawdown": max_dd,
+        "max_drawdown_date": max_dd_date,
+        "periods": pd.DataFrame(periods) if periods else pd.DataFrame(),
+    }
+
+
 def markowitz_analysis(
     closes: pd.DataFrame,
     target_pct: dict[str, float],
