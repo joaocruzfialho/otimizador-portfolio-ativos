@@ -14,12 +14,6 @@ MAX_SNAPSHOTS = 500
 
 EDITOR_COLS = ["Ticker", "Percentagem Alvo (%)", "Quantidade Detida"]
 
-DEFAULT_PORTFOLIO = pd.DataFrame({
-    "Ticker": ["VWCE.DE", "AGGH.MI", "SGLD.MI", "BTC-EUR"],
-    "Percentagem Alvo (%)": [60.0, 25.0, 10.0, 5.0],
-    "Quantidade Detida": [10.0, 50.0, 5.0, 0.05],
-})
-
 # ─── Supabase client (lazy singleton) ──────────────────────────────
 
 _sb_client = None
@@ -42,55 +36,19 @@ def _sb():
 # ─── Portfolio persistence ──────────────────────────────────────────
 
 def load_portfolio() -> pd.DataFrame:
-    sb = _sb()
-    if sb:
-        try:
-            resp = sb.table("otimizador_portfolio").select("assets").eq("id", 1).execute()
-            if resp.data and resp.data[0].get("assets"):
-                df = pd.DataFrame([{
-                    "Ticker": a["ticker"],
-                    "Percentagem Alvo (%)": float(a["target_pct"]),
-                    "Quantidade Detida": float(a["quantity"]),
-                } for a in resp.data[0]["assets"]])
-                return df[EDITOR_COLS]
-        except Exception:
-            pass
-    # fallback: local file
-    if PORTFOLIO_FILE.exists():
-        try:
-            data = json.loads(PORTFOLIO_FILE.read_text(encoding="utf-8"))
-            rows = data.get("portfolio", [])
-            if rows:
-                df = pd.DataFrame([{
-                    "Ticker": r["ticker"],
-                    "Percentagem Alvo (%)": float(r["target_pct"]),
-                    "Quantidade Detida": float(r["quantity"]),
-                } for r in rows])
-                return df[EDITOR_COLS]
-        except Exception:
-            pass
-    return DEFAULT_PORTFOLIO.copy()
+    from core.db import load_portfolio as _db_load
+    return _db_load()
 
 
 def save_portfolio(df: pd.DataFrame) -> None:
+    from core.db import save_portfolio_from_editor as _db_save
+    _db_save(df)
+    # Keep local JSON backup for sidebar "último guardado" display
     assets = [{
         "ticker": str(row["Ticker"]),
         "target_pct": float(row["Percentagem Alvo (%)"]),
         "quantity": float(row["Quantidade Detida"]),
     } for _, row in df.iterrows() if str(row["Ticker"]).strip()]
-
-    sb = _sb()
-    if sb:
-        try:
-            sb.table("otimizador_portfolio").upsert({
-                "id": 1,
-                "updated_at": datetime.now().isoformat(),
-                "assets": assets,
-            }).execute()
-        except Exception:
-            pass
-
-    # always write local backup too
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     PORTFOLIO_FILE.write_text(json.dumps({
         "version": 1,

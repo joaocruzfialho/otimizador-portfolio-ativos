@@ -1,7 +1,7 @@
 """
-Otimizador de Portfólio de Ativos — v0.4.0
+Otimizador de Portfólio de Ativos — v0.6.0
 
-Tabs: Rebalancear · Cenários · Histórico · Risco · Otimizar · Backtest
+Tabs: Rebalancear · Cenários · Histórico · Risco · Otimizar · Backtest · Gerir
 Alertas por email configuráveis na sidebar.
 
 Autor: João Fialho
@@ -18,6 +18,10 @@ import streamlit as st
 
 from core.alerts import SmtpConfig, build_alert_html, send_alert_email
 from core.backtest import run_backtest
+from core.db import (
+    ASSET_TYPES, delete_asset, get_asset, get_tickers,
+    load_portfolio_full, upsert_asset,
+)
 from core.history import (
     append_snapshot, build_snapshot, df_to_export_json,
     history_to_evolution_dfs, load_history, load_portfolio,
@@ -30,7 +34,7 @@ from core.rebalance import (
 )
 from core.risk import compute_risk_metrics, markowitz_analysis
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 PERIOD_OPTIONS = {
     "1 mês": "1mo", "3 meses": "3mo", "6 meses": "6mo",
@@ -82,6 +86,7 @@ _defaults: dict = {
     "bkt_period": "3 anos",
     "bkt_capital": 10000.0,
     "bkt_freq": "Trimestral",
+    "del_pending": None,
     # email (never persisted to disk)
     "smtp_host": "smtp.gmail.com",
     "smtp_port": 587,
@@ -231,9 +236,9 @@ else:
 # Tabs
 # ──────────────────────────────────────────────
 
-tab_reb, tab_cen, tab_his, tab_ris, tab_opt, tab_bkt = st.tabs([
+tab_reb, tab_cen, tab_his, tab_ris, tab_opt, tab_bkt, tab_mgr = st.tabs([
     "💼 Rebalancear", "🎯 Cenários", "📈 Histórico",
-    "⚖️ Risco", "🔬 Otimizar", "🔄 Backtest",
+    "⚖️ Risco", "🔬 Otimizar", "🔄 Backtest", "⚙️ Gerir",
 ])
 
 
@@ -818,6 +823,123 @@ with tab_bkt:
         )
     else:
         st.info("Define os parâmetros e clica em **Executar Backtest**.")
+
+
+# ══════════════════════════════════════════════
+# Tab 7: Gerir
+# ══════════════════════════════════════════════
+
+with tab_mgr:
+    st.markdown("### Gestão de Ativos")
+    st.caption("Adiciona, edita ou elimina ativos. As alterações reflectem-se imediatamente nas outras tabs.")
+
+    full_df = load_portfolio_full()
+    if not full_df.empty:
+        st.markdown("#### Portfólio Atual")
+        st.dataframe(full_df.style.format({
+            "Percentagem Alvo (%)": "{:.2f}",
+            "Quantidade Detida": "{:.4f}",
+            "Preço Médio (€)": "{:.4f}",
+        }), use_container_width=True, hide_index=True)
+    else:
+        st.info("Portfólio vazio. Adiciona o primeiro ativo abaixo.")
+
+    st.divider()
+    st.markdown("#### Adicionar / Editar Ativo")
+
+    tickers_list = get_tickers()
+    mode = st.radio("Modo", ["Adicionar novo", "Editar existente"],
+                    horizontal=True, key="mgr_mode")
+
+    _empty: dict = {
+        "ticker": "", "name": "", "asset_type": ASSET_TYPES[0],
+        "exchange": "", "target_pct": 0.0, "quantity": 0.0, "avg_buy_price": 0.0,
+    }
+    prefill = _empty.copy()
+
+    if mode == "Editar existente":
+        if tickers_list:
+            sel = st.selectbox("Seleciona o Ativo", tickers_list, key="mgr_edit_sel")
+            asset_data = get_asset(sel)
+            if asset_data:
+                prefill = asset_data
+        else:
+            st.info("Não há ativos registados. Muda para **Adicionar novo**.")
+
+    with st.form("mgr_form"):
+        fc1, fc2 = st.columns(2)
+        f_ticker = fc1.text_input(
+            "Ticker *", value=prefill["ticker"],
+            disabled=(mode == "Editar existente"),
+            placeholder="ex: VWCE.DE",
+        )
+        f_name = fc2.text_input(
+            "Nome", value=prefill["name"],
+            placeholder="ex: Vanguard FTSE All-World",
+        )
+        fc3, fc4 = st.columns(2)
+        type_idx = ASSET_TYPES.index(prefill["asset_type"]) if prefill["asset_type"] in ASSET_TYPES else 0
+        f_type = fc3.selectbox("Tipo", ASSET_TYPES, index=type_idx)
+        f_exchange = fc4.text_input(
+            "Bolsa", value=prefill["exchange"],
+            placeholder="ex: XETRA",
+        )
+        fc5, fc6, fc7 = st.columns(3)
+        f_target = fc5.number_input(
+            "Alvo (%)", 0.0, 100.0,
+            float(prefill["target_pct"]), 0.5, format="%.2f", key="mgr_f_target",
+        )
+        f_qty = fc6.number_input(
+            "Quantidade Detida", 0.0,
+            value=float(prefill["quantity"]), step=0.0001, format="%.4f", key="mgr_f_qty",
+        )
+        f_avg = fc7.number_input(
+            "Preço Médio (€)", 0.0,
+            value=float(prefill["avg_buy_price"]), step=0.01, format="%.4f", key="mgr_f_avg",
+        )
+        submitted = st.form_submit_button("💾 Guardar", type="primary", use_container_width=True)
+
+    if submitted:
+        t_save = (prefill["ticker"] if mode == "Editar existente"
+                  else f_ticker.strip())
+        if not t_save:
+            st.error("O Ticker é obrigatório.")
+        else:
+            upsert_asset(t_save, f_name.strip(), f_type, f_exchange.strip(),
+                         f_target, f_qty, f_avg)
+            st.session_state.portfolio_df = load_portfolio()
+            st.session_state.result_df = None
+            st.session_state.editor_nonce += 1
+            st.success(f"✓ **{t_save}** guardado com sucesso.")
+            st.rerun()
+
+    st.divider()
+    st.markdown("#### Eliminar Ativo")
+
+    if tickers_list:
+        del_ticker = st.selectbox("Ativo a Eliminar", tickers_list, key="mgr_del_sel")
+        if st.button("🗑️ Iniciar eliminação", key="mgr_del_btn"):
+            st.session_state.del_pending = del_ticker
+
+        if st.session_state.get("del_pending"):
+            st.warning(
+                f"⚠️ Confirmas a eliminação de **{st.session_state.del_pending}**? "
+                "Esta acção não pode ser desfeita."
+            )
+            col_y, col_n = st.columns(2)
+            if col_y.button("✅ Confirmar", type="primary", key="mgr_del_yes"):
+                delete_asset(st.session_state.del_pending)
+                del st.session_state["del_pending"]
+                st.session_state.portfolio_df = load_portfolio()
+                st.session_state.result_df = None
+                st.session_state.editor_nonce += 1
+                st.success("✓ Ativo eliminado.")
+                st.rerun()
+            if col_n.button("❌ Cancelar", key="mgr_del_no"):
+                del st.session_state["del_pending"]
+                st.rerun()
+    else:
+        st.info("Sem ativos para eliminar.")
 
 
 # Footer
