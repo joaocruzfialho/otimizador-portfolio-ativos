@@ -39,18 +39,18 @@ from core.rebalance import (
 from core.risk import compute_drawdown, compute_risk_metrics, markowitz_analysis
 from core.tax import compute_unrealized_gains
 
-__version__ = "0.7.1"
+__version__ = "0.8.0"
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=None, show_spinner=False)
 def _cached_full() -> pd.DataFrame:
-    """Cache load_portfolio_full() — evita 3 requests HTTP ao Supabase por render."""
+    """Cache load_portfolio_full(). Never auto-expires — cleared only on writes."""
     return load_portfolio_full()
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=None, show_spinner=False)
 def _cached_history() -> list[dict]:
-    """Cache load_history() — evita 1 request HTTP ao Supabase por render."""
+    """Cache load_history(). Never auto-expires — cleared only on writes."""
     return load_history()
 
 
@@ -61,6 +61,24 @@ PERIOD_OPTIONS = {
 FREQ_OPTIONS = {
     "Mensal": "M", "Trimestral": "Q", "Anual": "A", "Nunca (Buy & Hold)": "never",
 }
+
+_LIGHT_CSS = """
+<style>
+.stApp { background-color: #ffffff !important; color: #31333F !important; }
+[data-testid="stSidebar"] { background-color: #f0f2f6 !important; }
+[data-testid="stSidebar"] * { color: #31333F !important; }
+.stMarkdown, .stText, p, h1, h2, h3, h4, h5, h6, label { color: #31333F !important; }
+.stDataFrame, [data-testid="stTable"] { background-color: #ffffff !important; }
+[data-testid="stMetricValue"] { color: #31333F !important; }
+[data-testid="stMetricLabel"] { color: #555555 !important; }
+.stTabs [data-baseweb="tab"] { color: #31333F !important; }
+.stTabs [data-baseweb="tab-panel"] { background-color: #ffffff !important; }
+[data-testid="stExpander"] { background-color: #f0f2f6 !important; }
+.stAlert { background-color: #f0f2f6 !important; }
+[class*="stNumberInput"], [class*="stTextInput"], [class*="stSelectbox"] textarea,
+[class*="stSelectbox"] input { background-color: #ffffff !important; color: #31333F !important; }
+</style>
+"""
 
 
 # ──────────────────────────────────────────────
@@ -86,8 +104,13 @@ def fetch_prices_and_fx(
 
 st.set_page_config(page_title="Otimizador de Portfólio", page_icon="📊", layout="wide")
 
+# Inject light theme CSS if needed (dark is the default in config.toml)
+if st.session_state.get("theme") == "Claro":
+    st.markdown(_LIGHT_CSS, unsafe_allow_html=True)
+
 _defaults: dict = {
     "portfolio_df": None,
+    "theme": "Escuro",
     "result_df": None,
     "editor_nonce": 0,
     "last_money": 1000.0,
@@ -138,6 +161,15 @@ if st.session_state.portfolio_df is None:
 # ──────────────────────────────────────────────
 
 with st.sidebar:
+    _theme_choice = st.radio(
+        "Tema", ["Escuro", "Claro"], horizontal=True,
+        index=0 if st.session_state.theme == "Escuro" else 1,
+        key="theme_radio",
+    )
+    if _theme_choice != st.session_state.theme:
+        st.session_state.theme = _theme_choice
+        st.rerun()
+
     st.header("Parâmetros")
     money_to_invest = st.number_input(
         "Valor a Investir (€)", min_value=0.0,

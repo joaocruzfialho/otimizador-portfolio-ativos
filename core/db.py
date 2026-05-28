@@ -81,6 +81,19 @@ def init_db() -> None:
                           (ticker, qty, avg or None))
 
 
+# ── SQLite helpers ─────────────────────────────────────
+
+def _sqlite_upsert_one(ticker, name, asset_type, exchange,
+                       target_pct, quantity, avg_buy_price) -> None:
+    with _conn() as c:
+        c.execute("INSERT OR REPLACE INTO assets VALUES (?,?,?,?)",
+                  (ticker, name, asset_type, exchange))
+        c.execute("INSERT OR REPLACE INTO target_allocations VALUES (?,?)",
+                  (ticker, target_pct))
+        c.execute("INSERT OR REPLACE INTO user_positions VALUES (?,?,?)",
+                  (ticker, quantity, avg_buy_price or None))
+
+
 # ── Supabase helpers ───────────────────────────────────
 
 def _sb_load_all(sb) -> list[dict] | None:
@@ -147,29 +160,9 @@ def _sb_delete_one(sb, ticker: str) -> None:
 
 # ── Public API ─────────────────────────────────────────
 
-def load_portfolio_full() -> pd.DataFrame:
-    """Return all assets with full metadata (7 columns)."""
-    sb = _sb()
-    if sb:
-        rows = _sb_load_all(sb)
-        if rows is not None:
-            if len(rows) == 0:
-                _sb_seed_from_jsonb(sb)
-                rows = _sb_load_all(sb) or []
-            if rows:
-                return pd.DataFrame([{
-                    "Ticker": r["ticker"],
-                    "Nome": r["name"],
-                    "Tipo": r["asset_type"],
-                    "Bolsa": r["exchange"],
-                    "Percentagem Alvo (%)": r["target_pct"],
-                    "Quantidade Detida": r["quantity"],
-                    "Preço Médio (€)": r["avg_buy_price"],
-                } for r in rows])[FULL_COLS]
-
-    # Fallback: SQLite
+def _sqlite_read_all() -> list[tuple]:
     with _conn() as c:
-        data = c.execute("""
+        return c.execute("""
             SELECT a.ticker, a.name, a.asset_type, a.exchange,
                    COALESCE(al.target_pct, 0), COALESCE(p.quantity, 0),
                    COALESCE(p.avg_buy_price, 0)
@@ -178,9 +171,37 @@ def load_portfolio_full() -> pd.DataFrame:
             LEFT JOIN user_positions p ON p.ticker = a.ticker
             ORDER BY a.ticker
         """).fetchall()
-    if not data:
-        return pd.DataFrame(columns=FULL_COLS)
-    return pd.DataFrame(data, columns=FULL_COLS)
+
+
+def load_portfolio_full() -> pd.DataFrame:
+    """Return all assets with full metadata (7 columns).
+
+    Read order: SQLite first (local, fast). Supabase is only consulted when
+    SQLite is empty — i.e. on a fresh Render container after restart. This
+    eliminates all HTTP round-trips during normal renders.
+    """
+    data = _sqlite_read_all()
+    if data:
+        return pd.DataFrame(data, columns=FULL_COLS)
+
+    # SQLite empty → fresh deploy: sync once from Supabase then read locally
+    sb = _sb()
+    if sb:
+        rows = _sb_load_all(sb)
+        if rows is not None:
+            if len(rows) == 0:
+                _sb_seed_from_jsonb(sb)
+                rows = _sb_load_all(sb) or []
+            for r in rows:
+                _sqlite_upsert_one(
+                    r["ticker"], r["name"], r["asset_type"], r["exchange"],
+                    r["target_pct"], r["quantity"], r["avg_buy_price"],
+                )
+            data = _sqlite_read_all()
+            if data:
+                return pd.DataFrame(data, columns=FULL_COLS)
+
+    return pd.DataFrame(columns=FULL_COLS)
 
 
 def load_portfolio() -> pd.DataFrame:
@@ -256,13 +277,8 @@ def upsert_asset(
 ) -> None:
     """Insert or update a single asset across all 3 tables."""
     ticker = ticker.strip()
-    with _conn() as c:
-        c.execute("INSERT OR REPLACE INTO assets VALUES (?,?,?,?)",
-                  (ticker, name, asset_type, exchange))
-        c.execute("INSERT OR REPLACE INTO target_allocations VALUES (?,?)",
-                  (ticker, target_pct))
-        c.execute("INSERT OR REPLACE INTO user_positions VALUES (?,?,?)",
-                  (ticker, quantity, avg_buy_price or None))
+    _sqlite_upsert_one(ticker, name, asset_type, exchange,
+                       target_pct, quantity, avg_buy_price)
     sb = _sb()
     if sb:
         try:

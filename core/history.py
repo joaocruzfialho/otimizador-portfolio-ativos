@@ -71,6 +71,16 @@ def df_to_export_json(df: pd.DataFrame) -> str:
 # ─── Snapshot persistence ───────────────────────────────────────────
 
 def load_history() -> list[dict]:
+    """Read snapshots. Local file first (fast); Supabase only on fresh deploy."""
+    if HISTORY_FILE.exists():
+        try:
+            snaps = json.loads(HISTORY_FILE.read_text(encoding="utf-8")).get("snapshots", [])
+            if snaps is not None:   # empty list is valid (no snapshots yet)
+                return snaps
+        except Exception:
+            pass
+
+    # Local file missing → fresh deploy: sync once from Supabase then cache locally
     sb = _sb()
     if sb:
         try:
@@ -82,19 +92,19 @@ def load_history() -> list[dict]:
                 .execute()
             )
             if resp.data:
-                return [{
+                snaps = [{
                     "ts": r["ts"],
                     "tag": r.get("tag", "manual"),
                     "money_invested": float(r.get("money_invested", 0)),
                     "total_value_eur": float(r.get("total_value_eur", 0)),
                     "assets": r.get("assets", []),
                 } for r in resp.data]
-        except Exception:
-            pass
-    # fallback: local file
-    if HISTORY_FILE.exists():
-        try:
-            return json.loads(HISTORY_FILE.read_text(encoding="utf-8")).get("snapshots", [])
+                DATA_DIR.mkdir(parents=True, exist_ok=True)
+                HISTORY_FILE.write_text(json.dumps(
+                    {"version": 1, "snapshots": snaps},
+                    indent=2, ensure_ascii=False,
+                ), encoding="utf-8")
+                return snaps
         except Exception:
             pass
     return []
