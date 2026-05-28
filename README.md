@@ -1,15 +1,17 @@
 # Otimizador de Portfólio de Ativos
 
-App Streamlit para rebalanceamento inteligente de portfólios de investimento, com **alertas** de desvio e cálculo de **compras corretivas** (nunca sugere vendas).
+App Streamlit para rebalanceamento inteligente de portfólios de investimento, com **alertas**, **histórico**, **comparação de cenários** e **análise de risco**.
 
 ## Funcionalidades
 
-- Define o portfólio com **Tickers**, **Percentagens Alvo** (soma = 100%) e **Quantidades Detidas**
-- Obtém preços atuais via [yfinance](https://github.com/ranaroussi/yfinance) (Yahoo Finance)
-- Recebe um valor em **euros** a investir
-- Calcula a distribuição que aproxima a alocação alvo **sem vender** (apenas compras)
-- Mostra alertas de desvio configuráveis
-- Compara a alocação atual, alvo e final pós-investimento
+- 💼 **Rebalanceamento sem vendas** — algoritmo iterativo que distribui o investimento garantindo apenas compras corretivas
+- 💱 **Conversão automática para EUR** via yfinance (USD, GBP, HKD, ...)
+- 🍩 **Donuts comparativos** — alocação atual vs. alvo vs. final
+- 🩺 **Score de saúde** + alerta de concentração + sugestão de urgência
+- 💾 **Persistência** — `data/portfolio.json` (auto-save) + import/export JSON
+- 📈 **Histórico de snapshots** — gravados em `data/history.json` em cada *aplicar*; gráficos de evolução do valor e alocação
+- 🎯 **Comparação de cenários** — calcular rebalanceamento para vários valores em € lado a lado
+- ⚖️ **Análise de risco** — volatilidade anualizada, matriz de correlação, métricas de portfólio (retorno, vol, Sharpe)
 
 ## Como correr
 
@@ -25,36 +27,38 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-Abre automaticamente em `http://localhost:8501`.
-
-## Algoritmo de Rebalanceamento (sem vendas)
-
-Dado:
-
-- $C_i$ — valor atual de cada ativo
-- $T_i$ — peso alvo (em %, soma 100)
-- $M$ — montante a investir
-
-Pretende-se encontrar $X_i \geq 0$ (compras) tal que, após o investimento, a alocação se aproxime de $T_i$, com $\sum X_i = M$.
-
-**Solução iterativa:**
-
-1. Calcular o valor total pós-investimento $V = \sum C_i + M$.
-2. Para cada ativo, ideal $V_i^* = T_i \cdot V$. Se $V_i^* < C_i$, o ativo está sobre-alocado — **fixa-se** ($X_i = 0$).
-3. Renormalizar os pesos alvo dos ativos restantes e redistribuir o capital remanescente.
-4. Repetir até nenhum ativo novo ficar sobre-alocado.
-
-Garante-se assim que todas as compras são $\geq 0$ e o total investido é exatamente $M$.
+Abre em `http://localhost:8501`.
 
 ## Estrutura
 
 ```
 .
-├── app.py            # App Streamlit + algoritmo
-├── requirements.txt  # Dependências
+├── app.py            # App Streamlit (UI + algoritmo + análises)
+├── requirements.txt  # streamlit, yfinance, pandas, numpy, plotly
+├── data/             # portfolio.json + history.json (gitignored)
 ├── .gitignore
 └── README.md
 ```
+
+## Algoritmo de Rebalanceamento (sem vendas)
+
+Dado $C_i$ (valor atual), $T_i$ (peso alvo %), $M$ (montante a investir), encontra-se $X_i \geq 0$ (compras) tal que a alocação final aproxime $T_i$ com $\sum X_i = M$.
+
+Solução iterativa:
+
+1. $V = \sum C_i + M$. Ideal $V_i^* = T_i \cdot V$.
+2. Ativos com $V_i^* < C_i$ → fixa-se $X_i = 0$ (sobre-alocados).
+3. Renormaliza pesos alvo dos restantes e redistribui o capital remanescente.
+4. Repete até convergir. Garante $X_i \geq 0$ e $\sum X_i = M$ exato.
+
+## Análise de Risco
+
+- Preços históricos via `yf.download(...)` (cache de 30 min)
+- Retornos diários e estatísticas anualizadas (252 dias úteis)
+- Matriz de correlação entre retornos diários
+- Métricas de portfólio com pesos = alvo (assume EUR; ignora risco cambial)
+
+> **Nota:** Para ativos não-EUR, a volatilidade calculada é em moeda nativa; o risco cambial adiciona-se à exposição real do investidor europeu.
 
 ## Autor
 
