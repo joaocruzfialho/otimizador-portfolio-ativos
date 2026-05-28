@@ -39,7 +39,7 @@ from core.rebalance import (
 from core.risk import compute_drawdown, compute_risk_metrics, markowitz_analysis
 from core.tax import compute_unrealized_gains
 
-__version__ = "0.8.0"
+__version__ = "0.8.1"
 
 
 @st.cache_data(ttl=None, show_spinner=False)
@@ -64,19 +64,122 @@ FREQ_OPTIONS = {
 
 _LIGHT_CSS = """
 <style>
-.stApp { background-color: #ffffff !important; color: #31333F !important; }
-[data-testid="stSidebar"] { background-color: #f0f2f6 !important; }
-[data-testid="stSidebar"] * { color: #31333F !important; }
-.stMarkdown, .stText, p, h1, h2, h3, h4, h5, h6, label { color: #31333F !important; }
-.stDataFrame, [data-testid="stTable"] { background-color: #ffffff !important; }
-[data-testid="stMetricValue"] { color: #31333F !important; }
-[data-testid="stMetricLabel"] { color: #555555 !important; }
-.stTabs [data-baseweb="tab"] { color: #31333F !important; }
-.stTabs [data-baseweb="tab-panel"] { background-color: #ffffff !important; }
-[data-testid="stExpander"] { background-color: #f0f2f6 !important; }
-.stAlert { background-color: #f0f2f6 !important; }
-[class*="stNumberInput"], [class*="stTextInput"], [class*="stSelectbox"] textarea,
-[class*="stSelectbox"] input { background-color: #ffffff !important; color: #31333F !important; }
+/* === TEMA CLARO === */
+
+/* Fundo principal */
+.stApp, [data-testid="stAppViewContainer"],
+[data-testid="stMain"], .main                { background-color: #f5f7fa !important; }
+section[data-testid="stSidebar"] + section   { background-color: #f5f7fa !important; }
+
+/* Header/toolbar do Streamlit */
+header, header[data-testid="stHeader"],
+[data-testid="stHeader"],
+[data-testid="stToolbar"]                    { background: #ffffff !important;
+                                               border-bottom: 1px solid #dde1eb !important; }
+[data-testid="stDecoration"]                 { background: #1f77b4 !important; }
+
+/* Sidebar */
+[data-testid="stSidebar"]                    { background-color: #eaecf4 !important; }
+[data-testid="stSidebarContent"],
+[data-testid="stSidebar"] *                  { color: #2c3e50 !important; }
+
+/* Texto geral */
+.stMarkdown *, p, h1, h2, h3, h4, h5, h6,
+.stText, [data-testid="stText"],
+[data-testid="stCaptionContainer"] *         { color: #2c3e50 !important; }
+small, .stCaption, [class*="caption"]        { color: #5e6b7a !important; }
+code                                         { color: #c7254e !important;
+                                               background: #f0f0f0 !important; }
+
+/* Métricas */
+[data-testid="stMetricValue"]               { color: #1a2535 !important; }
+[data-testid="stMetricLabel"]               { color: #5e6b7a !important; }
+
+/* Botões */
+.stButton > button,
+.stDownloadButton > button                  { background-color: #1f77b4 !important;
+                                              color: #ffffff !important;
+                                              border: 1px solid #1a66a0 !important; }
+.stButton > button[kind="secondary"]        { background-color: #e8ecf4 !important;
+                                              color: #2c3e50 !important;
+                                              border: 1px solid #c0c8d8 !important; }
+[data-testid="stFileUploader"] button       { background-color: #e8ecf4 !important;
+                                              color: #2c3e50 !important; }
+
+/* Inputs BaseWeb */
+[data-baseweb="input"],
+[data-baseweb="base-input"],
+[data-baseweb="input"] > div               { background-color: #ffffff !important; }
+[data-baseweb="input"] input,
+[data-baseweb="base-input"] input,
+input                                       { background-color: #ffffff !important;
+                                              color: #2c3e50 !important; }
+[data-testid="stNumberInput"] button        { background-color: #e8ecf4 !important;
+                                              color: #2c3e50 !important; }
+
+/* Selectbox */
+[data-baseweb="select"] > div,
+[data-baseweb="select"] [data-baseweb="input"]  { background-color: #ffffff !important;
+                                                  color: #2c3e50 !important; }
+[data-baseweb="popover"],
+[data-baseweb="menu"]                           { background-color: #ffffff !important; }
+[role="option"]                                 { background-color: #ffffff !important;
+                                                  color: #2c3e50 !important; }
+[role="option"]:hover                           { background-color: #e8ecf4 !important; }
+
+/* Labels de widgets */
+[data-testid="stWidgetLabel"],
+[data-testid="stWidgetLabel"] *             { color: #2c3e50 !important; }
+
+/* File uploader */
+[data-testid="stFileUploader"],
+[data-testid="stFileUploader"] > div,
+[data-testid="stFileUploader"] > div > div  { background-color: #eaecf4 !important; }
+[data-testid="stFileUploaderDropzone"],
+section[data-testid="stFileUploaderDropzone"] {
+                                              background-color: #eaecf4 !important;
+                                              border: 2px dashed #b0b8cc !important; }
+[data-testid="stFileUploader"] *,
+[data-testid="stFileUploaderDropzone"] *     { color: #2c3e50 !important; }
+[data-testid="stFileUploaderDropzone"] button {
+                                              background-color: #ffffff !important;
+                                              color: #1f77b4 !important;
+                                              border: 1px solid #1f77b4 !important; }
+
+/* Tabs */
+[data-baseweb="tab-list"]                   { background: transparent !important;
+                                              border-bottom: 2px solid #dde1eb !important; }
+[data-baseweb="tab"]                        { color: #5e6b7a !important;
+                                              background: transparent !important; }
+[aria-selected="true"][data-baseweb="tab"]  { color: #1f77b4 !important; }
+
+/* Alertas */
+[data-testid="stAlert"] > div              { color: #2c3e50 !important; }
+
+/* Expanders */
+[data-testid="stExpander"],
+[data-testid="stExpander"] > details       { background-color: #eaecf4 !important; }
+[data-testid="stExpander"] summary,
+[data-testid="stExpander"] summary *       { color: #2c3e50 !important; }
+
+/* Dataframe / DataEditor: wrapper branco para minimizar contraste */
+[data-testid="stDataFrame"],
+[data-testid="stDataEditor"]               { background-color: #ffffff !important;
+                                             border-radius: 6px !important;
+                                             overflow: hidden !important; }
+
+/* Slider */
+[data-testid="stSlider"] *                 { color: #2c3e50 !important; }
+
+/* Radio / Checkbox */
+[data-baseweb="radio"] *,
+[data-baseweb="checkbox"] *                { color: #2c3e50 !important; }
+
+/* Dividers */
+hr                                         { border-color: #c8d0de !important; }
+
+/* Plotly charts background */
+.js-plotly-plot .plotly .bg               { fill: #f5f7fa !important; }
 </style>
 """
 
