@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 
@@ -19,8 +20,42 @@ DEFAULT_PORTFOLIO = pd.DataFrame({
     "Quantidade Detida": [10.0, 50.0, 5.0, 0.05],
 })
 
+# ─── Supabase client (lazy singleton) ──────────────────────────────
+
+_sb_client = None
+
+def _sb():
+    """Returns a Supabase client if env vars are set, else None."""
+    global _sb_client
+    if _sb_client is None:
+        url = os.environ.get("SUPABASE_URL", "")
+        key = os.environ.get("SUPABASE_KEY", "")
+        if url and key:
+            try:
+                from supabase import create_client
+                _sb_client = create_client(url, key)
+            except Exception:
+                pass
+    return _sb_client
+
+
+# ─── Portfolio persistence ──────────────────────────────────────────
 
 def load_portfolio() -> pd.DataFrame:
+    sb = _sb()
+    if sb:
+        try:
+            resp = sb.table("otimizador_portfolio").select("assets").eq("id", 1).execute()
+            if resp.data and resp.data[0].get("assets"):
+                df = pd.DataFrame([{
+                    "Ticker": a["ticker"],
+                    "Percentagem Alvo (%)": float(a["target_pct"]),
+                    "Quantidade Detida": float(a["quantity"]),
+                } for a in resp.data[0]["assets"]])
+                return df[EDITOR_COLS]
+        except Exception:
+            pass
+    # fallback: local file
     if PORTFOLIO_FILE.exists():
         try:
             data = json.loads(PORTFOLIO_FILE.read_text(encoding="utf-8"))
@@ -38,16 +73,29 @@ def load_portfolio() -> pd.DataFrame:
 
 
 def save_portfolio(df: pd.DataFrame) -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    rows = [{
+    assets = [{
         "ticker": str(row["Ticker"]),
         "target_pct": float(row["Percentagem Alvo (%)"]),
         "quantity": float(row["Quantidade Detida"]),
     } for _, row in df.iterrows() if str(row["Ticker"]).strip()]
+
+    sb = _sb()
+    if sb:
+        try:
+            sb.table("otimizador_portfolio").upsert({
+                "id": 1,
+                "updated_at": datetime.now().isoformat(),
+                "assets": assets,
+            }).execute()
+        except Exception:
+            pass
+
+    # always write local backup too
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
     PORTFOLIO_FILE.write_text(json.dumps({
         "version": 1,
         "updated_at": datetime.now().isoformat(timespec="seconds"),
-        "portfolio": rows,
+        "portfolio": assets,
     }, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
@@ -62,7 +110,30 @@ def df_to_export_json(df: pd.DataFrame) -> str:
     }, indent=2, ensure_ascii=False)
 
 
+# ─── Snapshot persistence ───────────────────────────────────────────
+
 def load_history() -> list[dict]:
+    sb = _sb()
+    if sb:
+        try:
+            resp = (
+                sb.table("otimizador_snapshots")
+                .select("ts,tag,money_invested,total_value_eur,assets")
+                .order("ts", desc=False)
+                .limit(MAX_SNAPSHOTS)
+                .execute()
+            )
+            if resp.data:
+                return [{
+                    "ts": r["ts"],
+                    "tag": r.get("tag", "manual"),
+                    "money_invested": float(r.get("money_invested", 0)),
+                    "total_value_eur": float(r.get("total_value_eur", 0)),
+                    "assets": r.get("assets", []),
+                } for r in resp.data]
+        except Exception:
+            pass
+    # fallback: local file
     if HISTORY_FILE.exists():
         try:
             return json.loads(HISTORY_FILE.read_text(encoding="utf-8")).get("snapshots", [])
@@ -72,6 +143,24 @@ def load_history() -> list[dict]:
 
 
 def write_history(snapshots: list[dict]) -> None:
+    """Replace entire history (used for 'clear history')."""
+    sb = _sb()
+    if sb:
+        try:
+            # Delete all rows first, then insert if any
+            sb.table("otimizador_snapshots").delete().neq("id", "00000000-0000-0000-0000-000000000000").execute()
+            if snapshots:
+                rows = [{
+                    "ts": s["ts"],
+                    "tag": s.get("tag", "manual"),
+                    "money_invested": float(s.get("money_invested", 0)),
+                    "total_value_eur": float(s["total_value_eur"]),
+                    "assets": s.get("assets", []),
+                } for s in snapshots[-MAX_SNAPSHOTS:]]
+                sb.table("otimizador_snapshots").insert(rows).execute()
+        except Exception:
+            pass
+
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     HISTORY_FILE.write_text(json.dumps(
         {"version": 1, "snapshots": snapshots[-MAX_SNAPSHOTS:]},
@@ -80,9 +169,31 @@ def write_history(snapshots: list[dict]) -> None:
 
 
 def append_snapshot(snap: dict) -> None:
-    snaps = load_history()
+    sb = _sb()
+    if sb:
+        try:
+            sb.table("otimizador_snapshots").insert({
+                "ts": snap["ts"],
+                "tag": snap.get("tag", "manual"),
+                "money_invested": float(snap.get("money_invested", 0)),
+                "total_value_eur": float(snap["total_value_eur"]),
+                "assets": snap.get("assets", []),
+            }).execute()
+        except Exception:
+            pass
+    # local backup
+    snaps = []
+    if HISTORY_FILE.exists():
+        try:
+            snaps = json.loads(HISTORY_FILE.read_text(encoding="utf-8")).get("snapshots", [])
+        except Exception:
+            pass
     snaps.append(snap)
-    write_history(snaps)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    HISTORY_FILE.write_text(json.dumps(
+        {"version": 1, "snapshots": snaps[-MAX_SNAPSHOTS:]},
+        indent=2, ensure_ascii=False,
+    ), encoding="utf-8")
 
 
 def build_snapshot(result_df: pd.DataFrame, *, use_final: bool,

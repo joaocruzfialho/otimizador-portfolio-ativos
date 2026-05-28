@@ -30,7 +30,7 @@ from core.rebalance import (
 )
 from core.risk import compute_risk_metrics, markowitz_analysis
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 PERIOD_OPTIONS = {
     "1 mês": "1mo", "3 meses": "3mo", "6 meses": "6mo",
