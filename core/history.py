@@ -9,17 +9,19 @@ import pandas as pd
 
 DATA_DIR = Path(__file__).parent.parent / "data"
 PORTFOLIO_FILE = DATA_DIR / "portfolio.json"
-HISTORY_FILE = DATA_DIR / "history.json"
 MAX_SNAPSHOTS = 500
 
 EDITOR_COLS = ["Ticker", "Percentagem Alvo (%)", "Quantidade Detida"]
 
-# ─── Supabase client (lazy singleton) ──────────────────────────────
+_DEV_USER_ID = "00000000-0000-0000-0000-000000000001"
+
+
+# ── Supabase client ──────────────────────────────────────────────────────
 
 _sb_client = None
 
+
 def _sb():
-    """Returns a Supabase client if env vars are set, else None."""
     global _sb_client
     if _sb_client is None:
         url = os.environ.get("SUPABASE_URL", "")
@@ -33,17 +35,22 @@ def _sb():
     return _sb_client
 
 
-# ─── Portfolio persistence ──────────────────────────────────────────
+def _history_file(user_id: str) -> Path:
+    """Per-user local history file."""
+    return DATA_DIR / f"history_{user_id[:8]}.json"
 
-def load_portfolio() -> pd.DataFrame:
+
+# ── Portfolio persistence ────────────────────────────────────────────────
+
+def load_portfolio(user_id: str = _DEV_USER_ID) -> pd.DataFrame:
     from core.db import load_portfolio as _db_load
-    return _db_load()
+    return _db_load(user_id)
 
 
-def save_portfolio(df: pd.DataFrame) -> None:
+def save_portfolio(df: pd.DataFrame, user_id: str = _DEV_USER_ID) -> None:
     from core.db import save_portfolio_from_editor as _db_save
-    _db_save(df)
-    # Keep local JSON backup for sidebar "último guardado" display
+    _db_save(df, user_id)
+    # Local JSON backup for sidebar "último guardado" display
     assets = [{
         "ticker": str(row["Ticker"]),
         "target_pct": float(row["Percentagem Alvo (%)"]),
@@ -68,25 +75,26 @@ def df_to_export_json(df: pd.DataFrame) -> str:
     }, indent=2, ensure_ascii=False)
 
 
-# ─── Snapshot persistence ───────────────────────────────────────────
+# ── Snapshot persistence ─────────────────────────────────────────────────
 
-def load_history() -> list[dict]:
-    """Read snapshots. Local file first (fast); Supabase only on fresh deploy."""
-    if HISTORY_FILE.exists():
+def load_history(user_id: str = _DEV_USER_ID) -> list[dict]:
+    """Local file first; Supabase only on fresh deploy (file missing)."""
+    hist_file = _history_file(user_id)
+    if hist_file.exists():
         try:
-            snaps = json.loads(HISTORY_FILE.read_text(encoding="utf-8")).get("snapshots", [])
-            if snaps is not None:   # empty list is valid (no snapshots yet)
+            snaps = json.loads(hist_file.read_text(encoding="utf-8")).get("snapshots", [])
+            if snaps is not None:
                 return snaps
         except Exception:
             pass
 
-    # Local file missing → fresh deploy: sync once from Supabase then cache locally
     sb = _sb()
     if sb:
         try:
             resp = (
                 sb.table("otimizador_snapshots")
                 .select("ts,tag,money_invested,total_value_eur,assets")
+                .eq("user_id", user_id)
                 .order("ts", desc=False)
                 .limit(MAX_SNAPSHOTS)
                 .execute()
@@ -100,9 +108,8 @@ def load_history() -> list[dict]:
                     "assets": r.get("assets", []),
                 } for r in resp.data]
                 DATA_DIR.mkdir(parents=True, exist_ok=True)
-                HISTORY_FILE.write_text(json.dumps(
-                    {"version": 1, "snapshots": snaps},
-                    indent=2, ensure_ascii=False,
+                hist_file.write_text(json.dumps(
+                    {"version": 1, "snapshots": snaps}, indent=2, ensure_ascii=False,
                 ), encoding="utf-8")
                 return snaps
         except Exception:
@@ -110,17 +117,16 @@ def load_history() -> list[dict]:
     return []
 
 
-def write_history(snapshots: list[dict]) -> None:
-    """Replace entire history (used for 'clear history')."""
+def write_history(snapshots: list[dict], user_id: str = _DEV_USER_ID) -> None:
     sb = _sb()
     if sb:
         try:
-            # Delete all rows first, then insert if any
-            sb.table("otimizador_snapshots").delete().neq("id", "00000000-0000-0000-0000-000000000000").execute()
+            sb.table("otimizador_snapshots").delete().eq("user_id", user_id).neq(
+                "id", "00000000-0000-0000-0000-000000000000").execute()
             if snapshots:
                 rows = [{
-                    "ts": s["ts"],
-                    "tag": s.get("tag", "manual"),
+                    "user_id": user_id,
+                    "ts": s["ts"], "tag": s.get("tag", "manual"),
                     "money_invested": float(s.get("money_invested", 0)),
                     "total_value_eur": float(s["total_value_eur"]),
                     "assets": s.get("assets", []),
@@ -129,36 +135,38 @@ def write_history(snapshots: list[dict]) -> None:
         except Exception:
             pass
 
+    hist_file = _history_file(user_id)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    HISTORY_FILE.write_text(json.dumps(
+    hist_file.write_text(json.dumps(
         {"version": 1, "snapshots": snapshots[-MAX_SNAPSHOTS:]},
         indent=2, ensure_ascii=False,
     ), encoding="utf-8")
 
 
-def append_snapshot(snap: dict) -> None:
+def append_snapshot(snap: dict, user_id: str = _DEV_USER_ID) -> None:
     sb = _sb()
     if sb:
         try:
             sb.table("otimizador_snapshots").insert({
-                "ts": snap["ts"],
-                "tag": snap.get("tag", "manual"),
+                "user_id": user_id,
+                "ts": snap["ts"], "tag": snap.get("tag", "manual"),
                 "money_invested": float(snap.get("money_invested", 0)),
                 "total_value_eur": float(snap["total_value_eur"]),
                 "assets": snap.get("assets", []),
             }).execute()
         except Exception:
             pass
-    # local backup
+
+    hist_file = _history_file(user_id)
     snaps = []
-    if HISTORY_FILE.exists():
+    if hist_file.exists():
         try:
-            snaps = json.loads(HISTORY_FILE.read_text(encoding="utf-8")).get("snapshots", [])
+            snaps = json.loads(hist_file.read_text(encoding="utf-8")).get("snapshots", [])
         except Exception:
             pass
     snaps.append(snap)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    HISTORY_FILE.write_text(json.dumps(
+    hist_file.write_text(json.dumps(
         {"version": 1, "snapshots": snaps[-MAX_SNAPSHOTS:]},
         indent=2, ensure_ascii=False,
     ), encoding="utf-8")
@@ -199,10 +207,8 @@ def history_to_evolution_dfs(snapshots: list[dict]) -> tuple[pd.DataFrame, pd.Da
         rows_total.append({"ts": ts, "Valor Total (€)": snap["total_value_eur"]})
         for a in snap["assets"]:
             rows_alloc.append({
-                "ts": ts,
-                "Ticker": a["ticker"],
-                "Valor (€)": a["value_eur"],
-                "Alocação (%)": a["allocation_pct"],
+                "ts": ts, "Ticker": a["ticker"],
+                "Valor (€)": a["value_eur"], "Alocação (%)": a["allocation_pct"],
             })
     df_t = pd.DataFrame(rows_total)
     df_a = pd.DataFrame(rows_alloc)

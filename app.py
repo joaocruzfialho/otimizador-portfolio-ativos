@@ -1,9 +1,9 @@
 """
-Otimizador de Portfólio de Ativos — v0.7.0
+Otimizador de Portfólio de Ativos — v0.9.0
 
 Tabs: Rebalancear · Cenários · Histórico · Risco · Otimizar · Backtest
       Dividendos · Fiscalidade · FIRE · Gerir
-Alertas por email configuráveis na sidebar.
+Multi-utilizador com autenticação Supabase e planos Free/Pro.
 
 Autor: João Fialho
 """
@@ -19,6 +19,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from core.alerts import SmtpConfig, build_alert_html, send_alert_email
+from core.auth import FREE_PLAN_LIMIT, get_email, get_plan, get_user_id, is_pro, logout, show_auth_page
 from core.backtest import MODEL_PORTFOLIOS, compare_model_portfolios, run_backtest
 from core.db import (
     ASSET_TYPES, delete_asset, get_asset, get_tickers,
@@ -39,19 +40,25 @@ from core.rebalance import (
 from core.risk import compute_drawdown, compute_risk_metrics, markowitz_analysis
 from core.tax import compute_unrealized_gains
 
-__version__ = "0.8.1"
+__version__ = "0.9.0"
 
 
 @st.cache_data(ttl=None, show_spinner=False)
-def _cached_full() -> pd.DataFrame:
-    """Cache load_portfolio_full(). Never auto-expires — cleared only on writes."""
-    return load_portfolio_full()
+def _cached_full(user_id: str) -> pd.DataFrame:
+    """Per-user cache of load_portfolio_full(). Cleared only on writes."""
+    return load_portfolio_full(user_id)
 
 
 @st.cache_data(ttl=None, show_spinner=False)
-def _cached_history() -> list[dict]:
-    """Cache load_history(). Never auto-expires — cleared only on writes."""
-    return load_history()
+def _cached_history(user_id: str) -> list[dict]:
+    """Per-user cache of load_history(). Cleared only on writes."""
+    return load_history(user_id)
+
+
+@st.cache_data(ttl=None, show_spinner=False)
+def _cached_history(user_id: str) -> list[dict]:
+    """Per-user cache of load_history(). Cleared only on writes."""
+    return load_history(user_id)
 
 
 PERIOD_OPTIONS = {
@@ -211,6 +218,12 @@ st.set_page_config(page_title="Otimizador de Portfólio", page_icon="📊", layo
 if st.session_state.get("theme") == "Claro":
     st.markdown(_LIGHT_CSS, unsafe_allow_html=True)
 
+# ── Auth gate ────────────────────────────────────────────────────────────
+if not show_auth_page():
+    st.stop()
+
+user_id: str = get_user_id()  # type: ignore[assignment]
+
 _defaults: dict = {
     "portfolio_df": None,
     "theme": "Escuro",
@@ -252,11 +265,11 @@ for k, v in _defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 if st.session_state.portfolio_df is None:
-    _full = _cached_full()
+    _full = _cached_full(user_id)
     if not _full.empty:
         st.session_state.portfolio_df = _full[EDITOR_COLS].reset_index(drop=True)
     else:
-        st.session_state.portfolio_df = load_portfolio()
+        st.session_state.portfolio_df = load_portfolio(user_id)
 
 
 # ──────────────────────────────────────────────
@@ -264,6 +277,16 @@ if st.session_state.portfolio_df is None:
 # ──────────────────────────────────────────────
 
 with st.sidebar:
+    # User info + logout
+    _plan = get_plan()
+    _badge = "⭐ Pro" if _plan == "pro" else "Gratuito"
+    _email = get_email() or ""
+    st.caption(f"**{_email}** · {_badge}")
+    if st.button("Sair", use_container_width=True, key="btn_logout"):
+        logout()
+
+    st.divider()
+
     _theme_choice = st.radio(
         "Tema", ["Escuro", "Claro"], horizontal=True,
         index=0 if st.session_state.theme == "Escuro" else 1,
@@ -292,7 +315,7 @@ with st.sidebar:
     col_a, col_b = st.columns(2)
     with col_a:
         if st.button("📥 Recarregar", use_container_width=True):
-            st.session_state.portfolio_df = load_portfolio()
+            st.session_state.portfolio_df = load_portfolio(user_id)
             st.session_state.result_df = None
             st.session_state.editor_nonce += 1
             st.rerun()
@@ -429,7 +452,7 @@ with tab_reb:
         st.session_state.result_df = compute_rebalance_result(
             edited_df, money_to_invest, prices, currencies, fx)
         st.session_state.portfolio_df = edited_df[EDITOR_COLS].copy()
-        save_portfolio(edited_df)
+        save_portfolio(edited_df, user_id)
         _cached_full.clear()
         st.rerun()
 
@@ -582,7 +605,7 @@ with tab_reb:
                      type="secondary", key="btn_apply"):
             append_snapshot(build_snapshot(df, use_final=True,
                                            money_invested=st.session_state.last_money,
-                                           tag="apply"))
+                                           tag="apply"), user_id)
             new_df = pd.DataFrame({
                 "Ticker": df["Ticker"].values,
                 "Percentagem Alvo (%)": df["Percentagem Alvo (%)"].values,
@@ -591,7 +614,7 @@ with tab_reb:
             st.session_state.portfolio_df = new_df
             st.session_state.result_df = None
             st.session_state.editor_nonce += 1
-            save_portfolio(new_df)
+            save_portfolio(new_df, user_id)
             _cached_full.clear()
             _cached_history.clear()
             st.success("✓ Quantidades atualizadas, portfólio guardado, snapshot no histórico.")
@@ -630,7 +653,7 @@ with tab_cen:
             for amt in parsed[:6]
         }
         st.session_state.portfolio_df = edited_df[EDITOR_COLS].copy()
-        save_portfolio(edited_df)
+        save_portfolio(edited_df, user_id)
         _cached_full.clear()
         st.rerun()
 
@@ -679,18 +702,18 @@ with tab_cen:
 
 with tab_his:
     st.markdown("### Histórico de Snapshots")
-    snapshots = _cached_history()
+    snapshots = _cached_history(user_id)
     col_top_a, col_top_b = st.columns([3, 1])
     col_top_a.metric("Snapshots guardados", len(snapshots))
     with col_top_b:
         if snapshots and st.button("🗑️ Limpar histórico", type="secondary"):
             _cached_history.clear()
-            write_history([])
+            write_history([], user_id)
             st.rerun()
 
     if st.session_state.result_df is not None:
         if st.button("📸 Tirar snapshot do estado atual"):
-            append_snapshot(build_snapshot(st.session_state.result_df, use_final=False, tag="manual"))
+            append_snapshot(build_snapshot(st.session_state.result_df, use_final=False, tag="manual"), user_id)
             _cached_history.clear()
             st.success("✓ Snapshot guardado.")
             st.rerun()
@@ -1035,7 +1058,7 @@ with tab_opt:
                 st.session_state.portfolio_df = new_df
                 st.session_state.result_df = None
                 st.session_state.editor_nonce += 1
-                save_portfolio(new_df)
+                save_portfolio(new_df, user_id)
                 _cached_full.clear()
                 st.success("✓ Pesos de Mínima Volatilidade aplicados.")
                 st.rerun()
@@ -1053,7 +1076,7 @@ with tab_opt:
                 st.session_state.portfolio_df = new_df
                 st.session_state.result_df = None
                 st.session_state.editor_nonce += 1
-                save_portfolio(new_df)
+                save_portfolio(new_df, user_id)
                 _cached_full.clear()
                 st.success("✓ Pesos de Máximo Sharpe aplicados.")
                 st.rerun()
@@ -1252,7 +1275,7 @@ with tab_div:
     st.markdown("### Dashboard de Dividendos")
     st.caption("Rendimento gerado pelos dividendos dos ativos, yield on cost e calendário de pagamentos.")
 
-    full_for_div = _cached_full()
+    full_for_div = _cached_full(user_id)
     if st.button("💰 Calcular Dividendos", type="primary",
                  disabled=edited_df.empty, key="btn_div"):
         with st.spinner("A obter histórico de dividendos..."):
@@ -1336,7 +1359,7 @@ with tab_tax:
         "Os ativos sem preço médio (= 0) são excluídos."
     )
 
-    full_for_tax = _cached_full()
+    full_for_tax = _cached_full(user_id)
     tx1, tx2 = st.columns([3, 1])
     tax_rate_pct = tx1.slider("Taxa de imposto sobre mais-valias (%)", 10.0, 50.0, 28.0, 1.0,
                                key="tax_rate_slider")
@@ -1582,7 +1605,7 @@ with tab_mgr:
     st.markdown("### Gestão de Ativos")
     st.caption("Adiciona, edita ou elimina ativos. As alterações reflectem-se imediatamente nas outras tabs.")
 
-    full_df = _cached_full()
+    full_df = _cached_full(user_id)
     if not full_df.empty:
         st.markdown("#### Portfólio Atual")
         st.dataframe(full_df.style.format({
@@ -1596,7 +1619,7 @@ with tab_mgr:
     st.divider()
     st.markdown("#### Adicionar / Editar Ativo")
 
-    tickers_list = list(_cached_full()["Ticker"]) if not full_df.empty else []
+    tickers_list = list(_cached_full(user_id)["Ticker"]) if not full_df.empty else []
     mode = st.radio("Modo", ["Adicionar novo", "Editar existente"],
                     horizontal=True, key="mgr_mode")
 
@@ -1609,7 +1632,7 @@ with tab_mgr:
     if mode == "Editar existente":
         if tickers_list:
             sel = st.selectbox("Seleciona o Ativo", tickers_list, key="mgr_edit_sel")
-            asset_data = get_asset(sel)
+            asset_data = get_asset(sel, user_id)
             if asset_data:
                 prefill = asset_data
         else:
@@ -1653,11 +1676,18 @@ with tab_mgr:
                   else f_ticker.strip())
         if not t_save:
             st.error("O Ticker é obrigatório.")
+        elif (mode == "Adicionar novo"
+              and not is_pro()
+              and len(tickers_list) >= FREE_PLAN_LIMIT):
+            st.warning(
+                f"O plano **Gratuito** está limitado a {FREE_PLAN_LIMIT} ativos. "
+                "Actualiza para **Pro** para adicionar mais."
+            )
         else:
             upsert_asset(t_save, f_name.strip(), f_type, f_exchange.strip(),
-                         f_target, f_qty, f_avg)
+                         f_target, f_qty, f_avg, user_id=user_id)
             _cached_full.clear()
-            st.session_state.portfolio_df = load_portfolio()
+            st.session_state.portfolio_df = load_portfolio(user_id)
             st.session_state.result_df = None
             st.session_state.editor_nonce += 1
             st.success(f"✓ **{t_save}** guardado com sucesso.")
@@ -1678,10 +1708,10 @@ with tab_mgr:
             )
             col_y, col_n = st.columns(2)
             if col_y.button("✅ Confirmar", type="primary", key="mgr_del_yes"):
-                delete_asset(st.session_state.del_pending)
+                delete_asset(st.session_state.del_pending, user_id)
                 _cached_full.clear()
                 del st.session_state["del_pending"]
-                st.session_state.portfolio_df = load_portfolio()
+                st.session_state.portfolio_df = load_portfolio(user_id)
                 st.session_state.result_df = None
                 st.session_state.editor_nonce += 1
                 st.success("✓ Ativo eliminado.")
